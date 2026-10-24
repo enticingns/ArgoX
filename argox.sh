@@ -16,7 +16,10 @@
 # License: MIT (see LICENSE)
 #
 
-VERSION='3.0.0 (2026.10.24)'
+# Keep our own version in a dedicated name: detect_os sources /etc/os-release,
+# which sets VERSION to something like "12 (bookworm)" on Debian and would
+# otherwise leak into the menu title and the saved state.
+ARGOX_VERSION='3.0.0 (2026.10.24)'
 
 # ============================================================
 # Paths and defaults
@@ -85,7 +88,7 @@ ARGO_AUTH=''              # credentials JSON (with TunnelSecret) or tunnel token
 ARGO_TUNNEL_ID=''         # override the TunnelID found in ARGO_AUTH
 ARGO_TUNNEL_NAME=''       # tunnel name, used when no ID/JSON is available
 ARGO_CRED_FILE=''         # reuse an existing tunnel credentials .json
-ARGO_INGRESS_SERVICE=''   # local target, default http://localhost:$NGINX_PORT
+ARGO_INGRESS_SERVICE=''   # local target, default http://127.0.0.1:$NGINX_PORT
 ARGO_EXTRA_HOSTS=''       # space separated extra hostnames on the same tunnel
 ARGO_CF_ARGS=''           # extra args appended to the cloudflared command
 
@@ -414,9 +417,17 @@ write_nginx_config() {
     auto) if [ "${IS_ARGO:-yes}" = 'yes' ]; then tls='no'; else tls='yes'; fi ;;
   esac
 
+  # Listen on both stacks. cloudflared resolves `localhost` to ::1 on hosts where
+  # /etc/hosts has no IPv4 entry for it, and an IPv4-only listener then answers
+  # "connection refused" to every tunnel request. Only add :: when IPv6 exists.
+  local v6='no'
+  [ -f /proc/net/if_inet6 ] && v6='yes'
+
   local listen_line http2_line ssl_block
   if [ "$tls" = 'yes' ]; then
     listen_line="listen ${NGINX_PORT} ssl;"
+    [ "$v6" = 'yes' ] && listen_line="listen ${NGINX_PORT} ssl;
+    listen [::]:${NGINX_PORT} ssl;"
     http2_line='http2 on;'
     ssl_block="ssl_certificate     ${WORK_DIR}/cert.pem;
     ssl_certificate_key ${WORK_DIR}/key.pem;
@@ -427,6 +438,8 @@ write_nginx_config() {
     ssl_session_timeout 10m;"
   else
     listen_line="listen ${NGINX_PORT};"
+    [ "$v6" = 'yes' ] && listen_line="listen ${NGINX_PORT};
+    listen [::]:${NGINX_PORT};"
     http2_line=''
     ssl_block=''
   fi
@@ -690,7 +703,7 @@ write_tunnel_yml() {
   local domain="${1:-$ARGO_DOMAIN}"
   local port="${2:-$NGINX_PORT}"
   local creds="${ARGO_CRED_FILE:-$WORK_DIR/tunnel.json}"
-  local service="${ARGO_INGRESS_SERVICE:-http://localhost:${port}}"
+  local service="${ARGO_INGRESS_SERVICE:-http://127.0.0.1:${port}}"
   local tunnel_id="${ARGO_TUNNEL_ID:-}" h
 
   # Tunnel identifier resolution order:
@@ -729,7 +742,7 @@ write_tunnel_yml() {
 write_cloudflared_service() {
   local cf="$WORK_DIR/cloudflared"
   local runs='' extra="${ARGO_CF_ARGS:-}"
-  local target="${ARGO_INGRESS_SERVICE:-http://localhost:${NGINX_PORT}}"
+  local target="${ARGO_INGRESS_SERVICE:-http://127.0.0.1:${NGINX_PORT}}"
 
   if [ -n "${ARGO_TOKEN:-}" ]; then
     # Token mode: the tunnel is fully described by the token.
@@ -812,8 +825,8 @@ enable_argo() {
     if [ -z "$ARGO_DOMAIN" ] && [ -n "${ARGO_TOKEN:-}" ]; then
       info "$(t 'Token mode: hostname comes from the Cloudflare tunnel config.' \
                'Token 模式：域名由 Cloudflare 侧隧道配置决定。')"
-      hint "$(t "Make sure the tunnel's Public Hostname points at http://localhost:${NGINX_PORT} — a mismatch shows up as HTTP 502." \
-                "请确认 Cloudflare 控制台里该隧道的 Public Hostname 指向 http://localhost:${NGINX_PORT} —— 不一致会表现为 HTTP 502。")"
+      hint "$(t "Make sure the tunnel's Public Hostname points at http://127.0.0.1:${NGINX_PORT} — a mismatch shows up as HTTP 502." \
+                "请确认 Cloudflare 控制台里该隧道的 Public Hostname 指向 http://127.0.0.1:${NGINX_PORT} —— 不一致会表现为 HTTP 502。")"
     elif [ -z "$ARGO_DOMAIN" ]; then
       warning "$(t 'Named tunnel needs a hostname: set ARGO_DOMAIN or OWN_DOMAIN.' \
                    '命名隧道需要域名：请设置 ARGO_DOMAIN 或 OWN_DOMAIN。')"
@@ -827,8 +840,8 @@ enable_argo() {
       fi
       write_tunnel_yml "$ARGO_DOMAIN" "$NGINX_PORT" \
         || die "$(t 'Failed to write tunnel.yml.' '写入 tunnel.yml 失败。')"
-      info "$(t "tunnel.yml: tunnel=${ARGO_TUNNEL_ID} host=${ARGO_DOMAIN} -> ${ARGO_INGRESS_SERVICE:-http://localhost:${NGINX_PORT}}" \
-               "tunnel.yml: 隧道=${ARGO_TUNNEL_ID} 域名=${ARGO_DOMAIN} -> ${ARGO_INGRESS_SERVICE:-http://localhost:${NGINX_PORT}}")"
+      info "$(t "tunnel.yml: tunnel=${ARGO_TUNNEL_ID} host=${ARGO_DOMAIN} -> ${ARGO_INGRESS_SERVICE:-http://127.0.0.1:${NGINX_PORT}}" \
+               "tunnel.yml: 隧道=${ARGO_TUNNEL_ID} 域名=${ARGO_DOMAIN} -> ${ARGO_INGRESS_SERVICE:-http://127.0.0.1:${NGINX_PORT}}")"
     fi
   else
     # Quick tunnel: drop any stale tunnel.yml so the service picks the quick path.
@@ -865,8 +878,9 @@ enable_argo() {
   fi
 
   # 8. Node address changed, so refresh the subscription files and state.
-  [ -n "${UUID:-}" ] && [ -n "${WS_PATH:-}" ] && \
-    write_subscriptions "$UUID" "$WS_PATH" "$ARGO_DOMAIN" 2>/dev/null || true
+  if [ -n "${UUID:-}" ] && [ -n "${WS_PATH:-}" ]; then
+    write_subscriptions "$UUID" "$WS_PATH" || true
+  fi
   save_state
 
   info "$(t "Argo Tunnel enabled. Tunnel domain: ${ARGO_DOMAIN}" "Argo 隧道已启用。隧道域名: ${ARGO_DOMAIN}")"
@@ -904,7 +918,7 @@ show_argo_config() {
   info "  $(t 'Tunnel ID   ' '隧道 ID     '): ${ARGO_TUNNEL_ID:-$(t '(from credentials)' '(取自凭据)')}"
   info "  $(t 'Tunnel name ' '隧道名称    '): ${ARGO_TUNNEL_NAME:-$(t '(unset)' '(未设置)')}"
   info "  $(t 'Credentials ' '凭据文件    '): ${ARGO_CRED_FILE:-$WORK_DIR/tunnel.json}"
-  info "  $(t 'Ingress     ' '本地转发    '): ${ARGO_INGRESS_SERVICE:-http://localhost:${NGINX_PORT:-8080}}"
+  info "  $(t 'Ingress     ' '本地转发    '): ${ARGO_INGRESS_SERVICE:-http://127.0.0.1:${NGINX_PORT:-8080}}"
   info "  $(t 'Extra hosts ' '额外域名    '): ${ARGO_EXTRA_HOSTS:-$(t '(none)' '(无)')}"
   info "  $(t 'Extra args  ' '额外参数    '): ${ARGO_CF_ARGS:-$(t '(none)' '(无)')}"
   if [ -n "$ARGO_AUTH" ]; then
@@ -959,8 +973,8 @@ collect_argo_params() {
   reading "  > " _in
   [ -n "$_in" ] && ARGO_AUTH="$_in"
 
-  hint "$(t "Local ingress service [${ARGO_INGRESS_SERVICE:-http://localhost:${NGINX_PORT:-8080}}]: " \
-            "本地转发地址 [${ARGO_INGRESS_SERVICE:-http://localhost:${NGINX_PORT:-8080}}]: ")"
+  hint "$(t "Local ingress service [${ARGO_INGRESS_SERVICE:-http://127.0.0.1:${NGINX_PORT:-8080}}]: " \
+            "本地转发地址 [${ARGO_INGRESS_SERVICE:-http://127.0.0.1:${NGINX_PORT:-8080}}]: ")"
   reading "  > " _in
   [ -n "$_in" ] && ARGO_INGRESS_SERVICE="$_in"
 
@@ -1048,6 +1062,17 @@ validate_nginx_config() {
 # ============================================================
 # Node share link + subscription
 # ============================================================
+
+# The single source of truth for "what hostname do clients dial".
+# In tunnel mode that is the tunnel hostname, never the CDN placeholder.
+node_host() {
+  if [ "${IS_ARGO:-no}" = 'yes' ] && [ -n "${ARGO_DOMAIN:-}" ]; then
+    printf '%s' "$ARGO_DOMAIN"
+  else
+    printf '%s' "${CDN_DOMAIN:-}"
+  fi
+}
+
 vmess_share_link() {
   local cfg uuid=$1 ws_path=$2 domain=$3
   cfg=$(cat <<EOF
@@ -1073,7 +1098,8 @@ EOF
 }
 
 write_subscriptions() {
-  local uuid=$1 ws_path=$2 domain=$3
+  local uuid=$1 ws_path=$2 domain="${3:-$(node_host)}"
+  [ -z "$domain" ] && { warning "write_subscriptions: empty hostname"; return 1; }
   mkdir -p "$SUBSCRIBE_DIR"
   local link
   link=$(vmess_share_link "$uuid" "$ws_path" "$domain")
@@ -1117,7 +1143,7 @@ save_state() {
     printf 'SINGBOX_PORT=%q\n'         "${SINGBOX_PORT:-}"
     printf 'NGINX_PORT=%q\n'           "${NGINX_PORT:-}"
     printf 'NODE_NAME=%q\n'            "${NODE_NAME:-}"
-    printf 'SCRIPT_VERSION=%q\n'       "${VERSION:-}"
+    printf 'SCRIPT_VERSION=%q\n'       "${ARGOX_VERSION:-}"
     printf 'IS_ARGO=%q\n'              "${IS_ARGO:-no}"
     printf 'ARGO_DOMAIN=%q\n'          "${ARGO_DOMAIN:-}"
     printf 'ARGO_AUTH=%q\n'            "${ARGO_AUTH:-}"
@@ -1381,9 +1407,6 @@ install_flow() {
   info "$(t "Writing nginx config..." "写入 nginx 配置...")"
   write_nginx_config "$WS_PATH" "$SINGBOX_PORT" "$UUID"
 
-  info "$(t "Generating subscriptions..." "生成订阅文件...")"
-  write_subscriptions "$UUID" "$WS_PATH" "$CDN_DOMAIN"
-
   info "$(t "Validating configs..." "校验配置...")"
   validate_singbox_config || die "sing-box config validation failed"
   validate_nginx_config || die "nginx config validation failed"
@@ -1421,6 +1444,11 @@ install_flow() {
                                     'Argo 设置失败（见上方提示）。直连 CDN 模式仍可使用。')"
   fi
 
+  # Subscriptions are written only now, once the tunnel hostname is known.
+  # Generating them earlier baked in the CDN placeholder even in tunnel mode.
+  info "$(t "Generating subscriptions..." "生成订阅文件...")"
+  write_subscriptions "$UUID" "$WS_PATH"
+
   save_state
   IS_INSTALLED='yes'
 
@@ -1434,22 +1462,19 @@ install_flow() {
 # ============================================================
 display_node_info() {
   load_state || die "$(t 'Not installed. Run install first.' '尚未安装，请先执行安装。')"
-  local link sub_b64 sub_sr node_host mode
+  local link sub_b64 sub_sr host mode
   # In Argo mode the client dials the tunnel hostname, not the CDN domain.
-  node_host="$CDN_DOMAIN"
+  host=$(node_host)
   mode="VMess + WebSocket + TLS + CDN"
-  if [ "$IS_ARGO" = 'yes' ] && [ -n "$ARGO_DOMAIN" ]; then
-    node_host="$ARGO_DOMAIN"
-    mode="VMess + WebSocket + TLS + Argo Tunnel"
-  fi
+  [ "$IS_ARGO" = 'yes' ] && [ -n "$ARGO_DOMAIN" ] && mode="VMess + WebSocket + TLS + Argo Tunnel"
 
-  link=$(vmess_share_link "$UUID" "$WS_PATH" "$node_host")
-  sub_b64="https://${node_host}/${UUID}/subscribe/base64"
-  sub_sr="https://${node_host}/${UUID}/subscribe/shadowrocket"
+  link=$(vmess_share_link "$UUID" "$WS_PATH" "$host")
+  sub_b64="https://${host}/${UUID}/subscribe/base64"
+  sub_sr="https://${host}/${UUID}/subscribe/shadowrocket"
 
   title "=============== $(t 'Node Information' '节点信息') ==============="
   info "  $(t 'Name       ' '节点名称     '):  ${NODE_NAME}"
-  info "  $(t 'Address    ' '地址         '):  ${node_host}:443"
+  info "  $(t 'Address    ' '地址         '):  ${host}:443"
   info "  $(t 'Protocol   ' '协议         '):  ${mode}"
   info "  $(t 'UUID       ' 'UUID         '):  ${UUID}"
   info "  $(t 'WS Path    ' 'WebSocket 路径'):  /${WS_PATH}"
@@ -1553,7 +1578,7 @@ reconfigure() {
   write_singbox_config "$UUID" "$WS_PATH" "$SINGBOX_PORT" "$NODE_NAME"
   write_nginx_config "$WS_PATH" "$SINGBOX_PORT" "$UUID"
   write_tls_cert "$TLS_SERVER"
-  write_subscriptions "$UUID" "$WS_PATH" "$CDN_DOMAIN"
+  write_subscriptions "$UUID" "$WS_PATH"
   validate_singbox_config || die "sing-box config check failed after reconfigure"
   validate_nginx_config || die "nginx config check failed after reconfigure"
   systemctl restart "$SERVICE_NAME" "$NGINX_SERVICE"
@@ -1587,7 +1612,7 @@ menu() {
     exit 0
   fi
   clear
-  title "=============== ArgoX-Lite  v${VERSION}  ==============="
+  title "=============== ArgoX-Lite  v${ARGOX_VERSION}  ==============="
   [ -f /etc/os-release ] && { . /etc/os-release 2>/dev/null || true; }
   info "  $(t 'OS   ' '系统 '): ${ID:-unknown} ${VERSION_ID:-}   $(t 'Arch' '架构'): $(uname -m)"
   if [ "$IS_INSTALLED" = 'yes' ]; then
@@ -1643,7 +1668,7 @@ MENU
 # ============================================================
 print_help() {
   cat <<EOF
-ArgoX-Lite  v${VERSION}
+ArgoX-Lite  v${ARGOX_VERSION}
 sing-box VMess + WebSocket + TLS + CDN deploy script
 (Optionally with Cloudflare Argo Tunnel)
 
