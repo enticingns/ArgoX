@@ -1,11 +1,11 @@
 # ArgoX-Lite
 
-**Sing-box 专用代理部署脚本** — 单一核心、单一节点模式，把原 ArgoX 的 6900+ 行精简为约 1200 行。
+**Sing-box 专用代理部署脚本** — 单一核心、单一节点模式，把原 ArgoX 的 6900+ 行精简为约 2011 行。
 
 - 代理核心：**sing-box**（唯一，v1.10+，验证版本 v1.14.4）
 - 节点模式：**VMess + WebSocket + TLS + CDN**（唯一）
 - TLS 终止位置：**nginx**（sing-box 侧仅监听 `127.0.0.1` 的明文 WS）
-- 可选：**Cloudflare Argo Tunnel**（cloudflared 接入）
+- 默认：**Cloudflare Argo Tunnel**（cloudflared 接入；命名隧道 / Token / 快速隧道三种模式）
 - 兼容客户端：Shadowrocket、SFA (sing-box)、v2rayN、v2rayNG、Clash.Meta 等任何支持 VMess + WS 的客户端
 
 ## 一键安装
@@ -132,6 +132,8 @@ bash argox.sh -u
 | `bash argox.sh -a -f config.conf` | 启用 Argo 并安装 |
 | `bash argox.sh -l E` | 英文模式 |
 | `bash argox.sh -n` | 查看节点信息与订阅 |
+| `bash argox.sh -d` | **自检**（服务/端口/出网/时间/端到端探测） |
+| `bash argox.sh -t` | **检查并修复系统时间**（VMess 需要时钟同步） |
 | `bash argox.sh -v` | 升级 sing-box |
 | `bash argox.sh -u` | 卸载 |
 | `bash argox.sh -h` | 帮助 |
@@ -149,7 +151,48 @@ bash argox.sh -u
 | 5 | 查看日志（sing-box + nginx + cloudflared） |
 | 6 | 卸载 |
 | 7 | Argo 隧道子菜单（启用/禁用/编辑隧道参数/查看配置） |
+| 8 | **自检诊断**（doctor） |
 | 0 | 退出 |
+
+## 自检（doctor）
+
+节点"能连上但用不了"时先跑这个：
+
+```bash
+bash argox.sh -d
+```
+
+它按顺序检查：
+
+| 检查项 | 说明 |
+|---|---|
+| 服务 | sing-box / argox-nginx / cloudflared 是否 active |
+| 监听端口 | sing-box 内部端口与 nginx 对外端口 |
+| 出网连通性 | **IPv4 与 IPv6 分别测**，并明确指出纯 IPv6 机器的问题 |
+| 系统时间 | 与 HTTPS 时间源比对，偏差 > 30 秒告警 |
+| 配置有效性 | `sing-box check` + `nginx -t` |
+| 端到端探测 | sing-box WS / nginx WS / 隧道 WS 是否 101，隧道订阅是否 200 |
+| 最近错误 | 最后 5 条真实错误（已过滤 OpenVZ 的 netlink 噪声） |
+
+最后给出结论：`全部检查通过` 或 `发现 N 个问题`。
+
+## 系统时间（重要）
+
+**VMess 用时间戳做认证**，客户端与服务器时间差超过约 90 秒就会全部认证失败 —— 而 TCP、TLS、WebSocket 握手全都是正常的，非常容易误判成"节点坏了"。
+
+安装时会自动检查并修复。手动执行：
+
+```bash
+bash argox.sh -t
+```
+
+修复逻辑：
+
+1. 先尝试 NTP（启动 `systemd-timesyncd`）
+2. NTP 不收敛时，直接读 HTTPS 响应头的 `Date` 校时（**不需要 NTP 端口**，IPv6 也能用）
+3. 校完执行 `hwclock --systohc` 写入硬件时钟
+
+之所以不用纯 NTP：很多 VPS 屏蔽出站 UDP/123，尤其纯 IPv6 的机器，NTP 根本不通。
 
 ## 文件位置
 
@@ -191,7 +234,7 @@ bash argox.sh -u
 - 端口与 UUID 校验、`find_free_port`、端口跳跃防火墙规则。
 - 非交互安装（`bash argox.sh -f config.conf`）。
 - 更新 sing-box 二进制并回滚保护。
-- **Cloudflare Argo Tunnel**：保留 cloudflared 集成（JSON / Token 两种认证），tunnel.yml 与 tunnel.json 由脚本生成，cloudflared 作为独立 systemd 服务运行。
+- **Cloudflare Argo Tunnel**：cloudflared 集成，支持命名隧道 / Token / 快速隧道三种模式，隧道参数（域名、隧道 ID/名称、凭据文件、ingress、额外域名、额外参数）全部可自定义。
 
 **新增**
 
@@ -210,10 +253,12 @@ bash argox.sh -u
 | 操作系统 | Debian/Ubuntu/Amaryan/Kali/Mint、CentOS/RHEL/Rocky/AlmaLinux/OL/AmazonLinux、Fedora、Arch/Manjaro/EndeavourOS/Garuda、Alpine、OpenSUSE。 |
 | 架构 | amd64 / 386 / armv5 / armv6 / armv7 / arm64 / mipsle / mips64le / riscv64 / loong64。 |
 | 服务管理器 | **仅 systemd**。Alpine 默认使用 OpenRC，请自行转换（`rc-service` 版本可用系统 unit 文件直接改）。 |
-| WebSocket 传输 | 使用 V2Ray Transport 中的 `type: ws`（**不是** HTTP 传输）。TLS 由 nginx 终止，sing-box 侧不启用 `tls`。 |
+| WebSocket 传输 | 使用 V2Ray Transport 中的 `type: ws`（**不是** HTTP 传输）。TLS 在 Cloudflare 边缘终止，nginx 走明文 HTTP，sing-box 侧不启用 `tls`。 |
 | 协议 | 仅 VMess。不再生成 VLESS / Trojan / SS / Hysteria2 / XHTTP 节点。 |
 | CDN | 用户自备 CDN 域名（Cloudflare 代理、任意 443 反代、或其他支持 WebSocket 的 CDN）。脚本不管理 Cloudflare 账号。 |
-| Argo 隧道 | **完全移除**。原 ArgoX 依赖的 cloudflared 及 Argo Tunnel 概念在此版本不再存在。 |
+| Argo 隧道 | 支持。命名隧道 / Token / 快速隧道（`*.trycloudflare.com`）三种模式，参数全部可自定义。 |
+| **出网要求** | **必须有 IPv4 出网**，否则纯 IPv4 站点（github、百度等）无法访问。纯 IPv6 的机器脚本会自动切 `prefer_ipv6`，但只能保证双栈站点可用。用 `-d` 可查看出网状态。 |
+| **系统时间** | 必须与真实时间相差在 ~90 秒内，否则 VMess 认证失败。安装时自动检查修复，也可用 `-t` 手动校时。 |
 | 客户端 | 生成的是标准 `vmess://` 分享链接和 Base64 订阅；所有主流 v2ray / sing-box 客户端均可解析。 |
 
 ## 部署方法
@@ -512,20 +557,51 @@ Client → ARGO_DOMAIN:443 (Cloudflare 边缘，TLS 在这里终止)
 
 ## 故障排查
 
+**第一步永远先跑自检：**
+
+```bash
+bash argox.sh -d
+```
+
+它会直接告诉你是「链路问题」还是「出网/时间问题」。
+
+### 按症状
+
+| 症状 | 先查什么 |
+|---|---|
+| **完全连不上** | `bash argox.sh -d` 看隧道 WS 是否 101。不是 101 就查 `journalctl -u cloudflared -n 50` |
+| **能连上但打不开网页** | ① 出网是否只有 IPv6（`-d` 会标红）② 时间偏差（`bash argox.sh -t`） |
+| **只有部分网站不行** | 典型是纯 IPv6 机器 —— IPv4-only 站点必然失败，需服务商给 IPv4 |
+| **HTTP 502** | 隧道 origin 端口和 `NGINX_PORT` 不一致 |
+| **HTTP 400 "plain HTTP to HTTPS port"** | `NGINX_TLS` 设错，隧道模式应为明文 HTTP |
+| **订阅 301** | 旧版本 bug，已修；升级脚本即可 |
+| **订阅里域名不对** | 旧版本用 `CDN_DOMAIN` 生成，已改为 `node_host()`；`bash argox.sh -n` 会显示实际使用的域名 |
+
+### 常见日志含义
+
+```
+dial tcp <IPv4>:443: i/o timeout          → 本机没有 IPv4 出网
+check interface: list routes: ...         → OpenVZ 的 netlink 噪声，无害（自检已过滤）
+Unable to reach the origin service ...    → 隧道 origin 端口不对，或 nginx 没起
+400 The plain HTTP request was sent ...   → nginx 开了 ssl 但前面是 Cloudflare 明文回源
+```
+
+### 其他
+
 - **sing-box 启动失败**：`journalctl -u sing-box -n 50`
 - **nginx 启动失败**：`journalctl -u argox-nginx -n 50`
-- **节点无法连接**：先确认 CDN 域名 443 能到 `nginx`；再检查订阅文件内容是否包含正确的 UUID 与路径。
-- **重新配置后**：脚本会自动 `restart` 两个服务；如需手动：`systemctl restart sing-box argox-nginx`。
-- **回滚 sing-box**：升级失败会自动把旧版本从 `/etc/argox/sing-box.<timestamp>.bak` 恢复。
+- **重新配置后**：脚本会自动 `restart`；手动则 `systemctl restart sing-box argox-nginx`
+- **回滚 sing-box**：升级失败会自动从 `/etc/argox/sing-box.<timestamp>.bak` 恢复
+- **日志太大**：`/etc/logrotate.d/argox-sing-box` 每周轮转保留 4 份；sing-box 自身不做轮转
 
 ## 目录
 
 ```
-argox.sh                       # 主脚本 (约 980 行)
+argox.sh                       # 主脚本
 config.conf                    # 非交互安装配置模板
 argox.sh.xray-original.bak     # 原 ArgoX v2.1.9 备份
 config.conf.xray-original.bak  # 原 config.conf 备份
-README.md                      # 本文件（已更新）
+README.md                      # 本文件
 README.md.xray-original.bak    # 原 README 备份
 LICENSE                        # MIT License
 ```
