@@ -65,6 +65,21 @@ IS_ARGO='no'
 ARGO_SERVICE='cloudflared'
 CLOUDFLARED_MIN_VERSION='2024.3.0'
 
+# Argo tunnel parameters — all optional, all overridable so you can drive your
+# own pre-created Cloudflare tunnel instead of the script's defaults.
+ARGO_DOMAIN=''            # hostname clients connect to (own domain)
+ARGO_AUTH=''              # credentials JSON (with TunnelSecret) or tunnel token
+ARGO_TUNNEL_ID=''         # override the TunnelID found in ARGO_AUTH
+ARGO_TUNNEL_NAME=''       # tunnel name, used when no ID/JSON is available
+ARGO_CRED_FILE=''         # reuse an existing tunnel credentials .json
+ARGO_INGRESS_SERVICE=''   # local target, default http://localhost:$NGINX_PORT
+ARGO_EXTRA_HOSTS=''       # space separated extra hostnames on the same tunnel
+ARGO_CF_ARGS=''           # extra args appended to the cloudflared command
+
+# Own domain for the node. When set it wins over CDN_DOMAIN and the public
+# CDN hint list, so you can point the node at your own zone.
+OWN_DOMAIN=''
+
 export DEBIAN_FRONTEND=noninteractive
 mkdir -p "$TEMP_DIR"
 cleanup() { rm -rf "$TEMP_DIR" 2>/dev/null; }
@@ -315,22 +330,19 @@ singbox_version_of() {
 write_singbox_config() {
   local uuid=$1 ws_path=$2 port=$3 node=$4
   # TLS is off here — nginx terminates TLS and forwards WS in clear text.
+  #
+  # Schema notes (verified against sing-box 1.14.4):
+  #   * log.keep_days does not exist -> "unknown field" hard error.
+  #   * No dns block: this box only accepts inbound connections and dials out
+  #     through `direct`, which falls back to the system resolver. The legacy
+  #     dns.servers[].address form was deprecated in 1.12 and removed in 1.14,
+  #     so leaving DNS out keeps the config valid across versions.
   cat > "$WORK_DIR/config.json" <<EOF
 {
   "log": {
     "level": "warning",
     "output": "${WORK_DIR}/sing-box.log",
-    "timestamp": true,
-    "keep_days": 3
-  },
-  "dns": {
-    "servers": [
-      { "tag": "remote", "address": "1.1.1.1", "address_resolver": "local" },
-      { "tag": "local",  "address": "223.5.5.5" }
-    ],
-    "rules": [
-      { "outbound": "any", "server": "local" }
-    ]
+    "timestamp": true
   },
   "inbounds": [
     {
@@ -350,8 +362,7 @@ write_singbox_config() {
   "outbounds": [
     { "type": "direct", "tag": "direct" },
     { "type": "block",  "tag": "block"  }
-  ],
-  "route": { "rules": [] }
+  ]
 }
 EOF
 }
@@ -484,9 +495,21 @@ WantedBy=multi-user.target
 EOF
 }
 
-# ============================================================
-# Cloudflare Argo Tunnel (optional)
-# ============================================================
+# sing-box has no built-in log rotation (log.keep_days does not exist), so give
+# the logfile a logrotate drop-in to stop it growing without bound.
+write_logrotate_config() {
+  [ -d /etc/logrotate.d ] || return 0
+  cat > /etc/logrotate.d/argox-sing-box <<EOF
+${WORK_DIR}/sing-box.log {
+    weekly
+    rotate 4
+    missingok
+    notifempty
+    compress
+    copytruncate
+}
+EOF
+}
 
 download_cloudflared() {
   local ver="${1:-latest}"
@@ -567,37 +590,67 @@ write_cloudflared_credentials() {
 }
 
 write_tunnel_yml() {
-  local domain=$1 port=$2 creds="$WORK_DIR/tunnel.json"
-  local tunnel_id
-  # Extract TunnelID from JSON
-  tunnel_id=$(grep -oE '"TunnelID"[[:space:]]*:[[:space:]]*"[^"]+"' <<< "$ARGO_JSON" \
-              | sed 's/.*"\([^"]*\)"$/\1/')
-  [ -z "$tunnel_id" ] && { warning "$(t 'No TunnelID in ARGO_JSON.' 'ARGO_JSON 中没有 TunnelID。')"; return 1; }
-  cat > "$WORK_DIR/tunnel.yml" <<EOF
-tunnel: ${tunnel_id}
-credentials-file: ${creds}
+  local domain="${1:-$ARGO_DOMAIN}"
+  local port="${2:-$NGINX_PORT}"
+  local creds="${ARGO_CRED_FILE:-$WORK_DIR/tunnel.json}"
+  local service="${ARGO_INGRESS_SERVICE:-http://localhost:${port}}"
+  local tunnel_id="${ARGO_TUNNEL_ID:-}" h
 
-ingress:
-  - hostname: ${domain}
-    service: http://localhost:${port}
+  # Tunnel identifier resolution order:
+  #   ARGO_TUNNEL_ID  ->  TunnelID inside ARGO_AUTH JSON  ->  ARGO_TUNNEL_NAME
+  if [ -z "$tunnel_id" ] && [ -n "$ARGO_JSON" ]; then
+    tunnel_id=$(grep -oE '"TunnelID"[[:space:]]*:[[:space:]]*"[^"]+"' <<< "$ARGO_JSON" \
+                | sed 's/.*"\([^"]*\)"$/\1/')
+  fi
+  [ -z "$tunnel_id" ] && tunnel_id="$ARGO_TUNNEL_NAME"
+  if [ -z "$tunnel_id" ]; then
+    warning "$(t 'No tunnel id: set ARGO_TUNNEL_ID, ARGO_TUNNEL_NAME, or an ARGO_AUTH JSON containing TunnelID.' \
+                 '缺少隧道标识：请设置 ARGO_TUNNEL_ID、ARGO_TUNNEL_NAME，或提供含 TunnelID 的 ARGO_AUTH JSON。')"
+    return 1
+  fi
+  if [ -z "$domain" ]; then
+    warning "$(t 'No tunnel hostname: set ARGO_DOMAIN (your own domain).' \
+                 '缺少隧道域名：请设置 ARGO_DOMAIN（你自己的域名）。')"
+    return 1
+  fi
 
-  - service: http_status:404
-EOF
+  {
+    printf 'tunnel: %s\n' "$tunnel_id"
+    printf 'credentials-file: %s\n' "$creds"
+    printf '\ningress:\n'
+    printf '  - hostname: %s\n    service: %s\n' "$domain" "$service"
+    for h in $ARGO_EXTRA_HOSTS; do
+      [ -n "$h" ] && printf '  - hostname: %s\n    service: %s\n' "$h" "$service"
+    done
+    printf '\n  - service: http_status:404\n'
+  } > "$WORK_DIR/tunnel.yml"
+
+  ARGO_TUNNEL_ID="$tunnel_id"
+  return 0
 }
 
 write_cloudflared_service() {
-  local creds="$WORK_DIR/tunnel.json"
-  local runs=""
-  if [ -n "$ARGO_TOKEN" ]; then
-    # Token mode (deprecated but still supported by Cloudflare)
-    runs="$WORK_DIR/cloudflared tunnel --token $ARGO_TOKEN"
+  local cf="$WORK_DIR/cloudflared"
+  local runs='' extra="${ARGO_CF_ARGS:-}"
+
+  if [ -n "${ARGO_TOKEN:-}" ]; then
+    # Token mode: the tunnel is fully described by the token.
+    runs="$cf tunnel --no-autoupdate run --token ${ARGO_TOKEN}${extra:+ $extra}"
   elif [ -s "$WORK_DIR/tunnel.yml" ]; then
-    # Named tunnel with credentials
-    runs="$WORK_DIR/cloudflared tunnel --config $WORK_DIR/tunnel.yml run"
+    # Named tunnel driven by our generated tunnel.yml + credentials file.
+    runs="$cf tunnel --no-autoupdate --config $WORK_DIR/tunnel.yml run${extra:+ $extra}"
+  elif [ -n "${ARGO_TUNNEL_NAME:-}" ]; then
+    # Fall back to a locally-registered tunnel (cert.pem based).
+    runs="$cf tunnel --no-autoupdate run ${ARGO_TUNNEL_NAME}${extra:+ $extra}"
   else
-    warning "$(t 'No tunnel.yml or token; skipping cloudflared service.' '缺少 tunnel.yml 或 token，跳过 cloudflared 服务。')"
+    warning "$(t 'No tunnel.yml, token, or tunnel name; cannot write cloudflared service.' \
+                 '缺少 tunnel.yml / token / 隧道名，无法写入 cloudflared 服务。')"
     return 1
   fi
+
+  # Type=simple already tracks the cloudflared process, so no PID file and no
+  # ExecStop juggling is needed. (The old ExecStartPost used `$$`, which systemd
+  # collapses to a literal `$`, so the pid file was never written anyway.)
   cat > /etc/systemd/system/${ARGO_SERVICE}.service <<EOF
 [Unit]
 Description=ArgoX-Lite Cloudflare Tunnel (cloudflared)
@@ -608,8 +661,6 @@ Wants=${NGINX_SERVICE}.service
 Type=simple
 User=root
 ExecStart=${runs}
-ExecStartPost=/bin/sh -c 'echo $$ > ${WORK_DIR}/cloudflared.pid'
-ExecStop=/bin/sh -c 'kill \$(cat ${WORK_DIR}/cloudflared.pid 2>/dev/null) 2>/dev/null'
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576
@@ -627,22 +678,49 @@ enable_argo() {
   cfver=$(cloudflared_version_of "$WORK_DIR/cloudflared")
   info "$(t "cloudflared v${cfver} installed" "cloudflared v${cfver} 已安装")"
 
-  # 2. Parse auth
+  # 2. Credentials: ARGO_AUTH, an existing ARGO_CRED_FILE, or a bare token
+  if [ -z "$ARGO_AUTH" ] && [ -n "${ARGO_CRED_FILE:-}" ] && [ -s "$ARGO_CRED_FILE" ]; then
+    ARGO_AUTH=$(tr -d '\n' < "$ARGO_CRED_FILE")
+    info "$(t "Using existing credentials: ${ARGO_CRED_FILE}" "使用已有凭据文件: ${ARGO_CRED_FILE}")"
+  fi
   if [ -z "$ARGO_AUTH" ] && [ -s "$WORK_DIR/tunnel.json" ]; then
     ARGO_AUTH=$(tr -d '\n' < "$WORK_DIR/tunnel.json")
   fi
-  parse_argo_auth "$ARGO_AUTH" || die "$(t 'ARGO_AUTH parse failed. Provide JSON with TunnelSecret or a 120-250 char token.' 'ARGO_AUTH 解析失败。需提供含 TunnelSecret 的 JSON 或 120-250 字符 Token。')"
+  if [ -n "$ARGO_AUTH" ]; then
+    parse_argo_auth "$ARGO_AUTH" || die "$(t 'ARGO_AUTH parse failed. Provide JSON with TunnelSecret, or a 120-250 char token.' \
+                                              'ARGO_AUTH 解析失败。需提供含 TunnelSecret 的 JSON，或 120-250 字符 Token。')"
+  elif [ -z "${ARGO_TUNNEL_NAME:-}" ]; then
+    die "$(t 'Nothing to run: set ARGO_AUTH, ARGO_CRED_FILE, or ARGO_TUNNEL_NAME.' \
+           '无法启动：请设置 ARGO_AUTH、ARGO_CRED_FILE 或 ARGO_TUNNEL_NAME。')"
+  fi
 
-  # 3. Domain
+  # 3. Hostname (own domain). Prefer explicit ARGO_DOMAIN, else OWN_DOMAIN,
+  #    else whatever a previous tunnel.yml already declared.
+  if [ -z "$ARGO_DOMAIN" ] && [ -n "${OWN_DOMAIN:-}" ]; then
+    ARGO_DOMAIN="$OWN_DOMAIN"
+  fi
   if [ -z "$ARGO_DOMAIN" ] && [ -s "$WORK_DIR/tunnel.yml" ]; then
     ARGO_DOMAIN=$(awk '/^[[:space:]]*- hostname:/{print $3; exit}' "$WORK_DIR/tunnel.yml")
   fi
-  [ -z "$ARGO_DOMAIN" ] && { warning "$(t 'No ARGO_DOMAIN set; skipping tunnel.yml.' '未设置 ARGO_DOMAIN，跳过 tunnel.yml。')"; return 1; }
+  if [ -z "$ARGO_DOMAIN" ] && [ -n "${ARGO_TOKEN:-}" ]; then
+    # Token mode carries its own hostname; nothing to write.
+    info "$(t 'Token mode: hostname comes from the Cloudflare tunnel config.' \
+             'Token 模式：域名由 Cloudflare 侧隧道配置决定。')"
+  elif [ -z "$ARGO_DOMAIN" ]; then
+    warning "$(t 'No tunnel hostname: set ARGO_DOMAIN or OWN_DOMAIN (your own domain).' \
+                 '缺少隧道域名：请设置 ARGO_DOMAIN 或 OWN_DOMAIN（你自己的域名）。')"
+    return 1
+  fi
 
-  # 4. Write credentials + tunnel.yml
-  if [ -n "$ARGO_JSON" ]; then
-    write_cloudflared_credentials
-    write_tunnel_yml "$ARGO_DOMAIN" "$NGINX_PORT" || die "$(t 'Failed to write tunnel.yml.' '写入 tunnel.yml 失败。')"
+  # 4. Write credentials + tunnel.yml (skipped in token mode)
+  if [ -z "${ARGO_TOKEN:-}" ] && [ -n "$ARGO_DOMAIN" ]; then
+    if [ -n "$ARGO_JSON" ] && [ -z "${ARGO_CRED_FILE:-}" ]; then
+      write_cloudflared_credentials
+    fi
+    write_tunnel_yml "$ARGO_DOMAIN" "$NGINX_PORT" \
+      || die "$(t 'Failed to write tunnel.yml.' '写入 tunnel.yml 失败。')"
+    info "$(t "tunnel.yml: tunnel=${ARGO_TUNNEL_ID} host=${ARGO_DOMAIN} -> ${ARGO_INGRESS_SERVICE:-http://localhost:${NGINX_PORT}}" \
+             "tunnel.yml: 隧道=${ARGO_TUNNEL_ID} 域名=${ARGO_DOMAIN} -> ${ARGO_INGRESS_SERVICE:-http://localhost:${NGINX_PORT}}")"
   fi
 
   # 5. Write service
@@ -670,26 +748,137 @@ disable_argo() {
   info "$(t 'Argo Tunnel disabled.' 'Argo 隧道已禁用。')"
 }
 
+show_argo_config() {
+  title "$(t 'Argo tunnel configuration' 'Argo 隧道配置')"
+  info "  $(t 'Enabled     ' '启用状态    '): ${IS_ARGO}"
+  info "  $(t 'Domain      ' '域名        '): ${ARGO_DOMAIN:-$(t '(unset)' '(未设置)')}"
+  info "  $(t 'Tunnel ID   ' '隧道 ID     '): ${ARGO_TUNNEL_ID:-$(t '(from credentials)' '(取自凭据)')}"
+  info "  $(t 'Tunnel name ' '隧道名称    '): ${ARGO_TUNNEL_NAME:-$(t '(unset)' '(未设置)')}"
+  info "  $(t 'Credentials ' '凭据文件    '): ${ARGO_CRED_FILE:-$WORK_DIR/tunnel.json}"
+  info "  $(t 'Ingress     ' '本地转发    '): ${ARGO_INGRESS_SERVICE:-http://localhost:${NGINX_PORT:-8080}}"
+  info "  $(t 'Extra hosts ' '额外域名    '): ${ARGO_EXTRA_HOSTS:-$(t '(none)' '(无)')}"
+  info "  $(t 'Extra args  ' '额外参数    '): ${ARGO_CF_ARGS:-$(t '(none)' '(无)')}"
+  if [ -n "$ARGO_AUTH" ]; then
+    info "  $(t 'Auth        ' '认证方式    '): $(t 'set' '已设置') ($(printf '%s' "$ARGO_AUTH" | wc -c) bytes)"
+  else
+    info "  $(t 'Auth        ' '认证方式    '): $(t '(unset)' '(未设置)')"
+  fi
+  [ -s "$WORK_DIR/tunnel.yml" ] && {
+    echo
+    hint "$WORK_DIR/tunnel.yml:"
+    sed 's/^/    /' "$WORK_DIR/tunnel.yml"
+  }
+  return 0
+}
+
+# Interactive editor for every Argo field. Empty input keeps the current value.
+collect_argo_params() {
+  local _in
+  title "$(t 'Argo tunnel parameters — Enter keeps the current value' \
+            'Argo 隧道参数 —— 回车保留当前值')"
+
+  hint "$(t "Own domain (hostname clients connect to) [${ARGO_DOMAIN:-unset}]: " \
+            "自有域名（客户端连接的域名）[${ARGO_DOMAIN:-未设置}]: ")"
+  reading "  > " _in
+  if [ -n "$_in" ]; then
+    if is_domain "$_in"; then ARGO_DOMAIN="$_in"
+    else warning "$(t 'Invalid domain, ignored.' '域名格式非法，已忽略。')"
+    fi
+  fi
+
+  hint "$(t "Tunnel ID (blank = take from credentials) [${ARGO_TUNNEL_ID:-auto}]: " \
+            "隧道 ID（留空 = 从凭据中读取）[${ARGO_TUNNEL_ID:-自动}]: ")"
+  reading "  > " _in
+  [ -n "$_in" ] && ARGO_TUNNEL_ID="$_in"
+
+  hint "$(t "Tunnel name (used when no ID/credentials) [${ARGO_TUNNEL_NAME:-unset}]: " \
+            "隧道名称（无 ID/凭据时使用）[${ARGO_TUNNEL_NAME:-未设置}]: ")"
+  reading "  > " _in
+  [ -n "$_in" ] && ARGO_TUNNEL_NAME="$_in"
+
+  hint "$(t "Credentials JSON path [${ARGO_CRED_FILE:-default}] : " \
+            "凭据 JSON 路径 [${ARGO_CRED_FILE:-默认}]: ")"
+  reading "  > " _in
+  if [ -n "$_in" ]; then
+    if [ -s "$_in" ]; then ARGO_CRED_FILE="$_in"
+    else warning "$(t 'File not found, ignored.' '文件不存在，已忽略。')"
+    fi
+  fi
+
+  hint "$(t "ARGO_AUTH: credentials JSON or tunnel token [Enter to keep]: " \
+            "ARGO_AUTH：凭据 JSON 或隧道 Token [回车保留]: ")"
+  reading "  > " _in
+  [ -n "$_in" ] && ARGO_AUTH="$_in"
+
+  hint "$(t "Local ingress service [${ARGO_INGRESS_SERVICE:-http://localhost:${NGINX_PORT:-8080}}]: " \
+            "本地转发地址 [${ARGO_INGRESS_SERVICE:-http://localhost:${NGINX_PORT:-8080}}]: ")"
+  reading "  > " _in
+  [ -n "$_in" ] && ARGO_INGRESS_SERVICE="$_in"
+
+  hint "$(t "Extra hostnames, space separated [${ARGO_EXTRA_HOSTS:-none}]: " \
+            "额外域名，空格分隔 [${ARGO_EXTRA_HOSTS:-无}]: ")"
+  reading "  > " _in
+  [ -n "$_in" ] && ARGO_EXTRA_HOSTS="$_in"
+
+  hint "$(t "Extra cloudflared args [${ARGO_CF_ARGS:-none}]: " \
+            "额外 cloudflared 参数 [${ARGO_CF_ARGS:-无}]: ")"
+  reading "  > " _in
+  [ -n "$_in" ] && ARGO_CF_ARGS="$_in"
+
+  save_state
+  info "$(t 'Argo parameters saved.' 'Argo 参数已保存。')"
+}
+
+argo_menu() {
+  while :; do
+    clear
+    title "=============== $(t 'Argo Tunnel' 'Argo 隧道') ==============="
+    info "  $(t 'State' '状态'): ${IS_ARGO}"
+    [ -n "$ARGO_DOMAIN" ] && info "  $(t 'Domain' '域名'): ${ARGO_DOMAIN}"
+    echo
+    cat <<'ARGOMENU'
+   [1] 启用 Argo 隧道   (Enable)
+   [2] 禁用 Argo 隧道   (Disable)
+   [3] 编辑隧道参数     (Edit tunnel parameters)
+   [4] 查看当前配置     (Show config)
+   [0] 返回             (Back)
+ARGOMENU
+    reading "  $(t 'Choose: ' '请选择: ')" _ac
+    case "${_ac:-}" in
+      1) IS_ARGO='yes'; save_state
+         enable_argo || true
+         pause ;;
+      2) IS_ARGO='no'; save_state
+         disable_argo
+         pause ;;
+      3) collect_argo_params; pause ;;
+      4) show_argo_config; pause ;;
+      0) return ;;
+      *) warning "$(t 'Invalid choice.' '非法输入。')"; pause ;;
+    esac
+  done
+}
+
 # Validate sing-box config before enabling service
 validate_singbox_config() {
   local bin="$WORK_DIR/sing-box" cfg="$WORK_DIR/config.json"
   if [ ! -x "$bin" ]; then die "sing-box binary not found at $bin"; fi
   if [ ! -s "$cfg" ]; then die "config not found at $cfg"; fi
 
-  # sing-box >= 1.11:  `sing-box check -c file`
-  # Fallback for older builds: `sing-box test -c file`
-  if "$bin" check -c "$cfg" >/dev/null 2>&1; then
+  # `sing-box check` exists since 1.11. There is no `test` subcommand — the
+  # old fallback only ever produced "unknown command test" noise, so it is gone.
+  if ! "$bin" check --help >/dev/null 2>&1; then
+    warning "$(t "This sing-box has no 'check' subcommand; skipping validation." "当前 sing-box 没有 check 子命令，跳过配置校验。")"
+    return 0
+  fi
+
+  local out
+  if out=$("$bin" check -c "$cfg" 2>&1); then
     info "$(t 'sing-box config OK' 'sing-box 配置校验通过')"
     return 0
   fi
-  if "$bin" test -c "$cfg" >/dev/null 2>&1; then
-    info "$(t 'sing-box config OK (test)' 'sing-box 配置校验通过 (test)')"
-    return 0
-  fi
-  # Print real error for diagnostics
-  local err
-  err=$("$bin" check -c "$cfg" 2>&1 || "$bin" test -c "$cfg" 2>&1)
-  warning "$(t 'sing-box config check FAILED:' 'sing-box 配置校验失败:')"; echo "$err"
+  warning "$(t 'sing-box config check FAILED:' 'sing-box 配置校验失败:')"
+  printf '%s\n' "$out"
   return 1
 }
 
@@ -768,19 +957,28 @@ save_state() {
   mkdir -p "$WORK_DIR"
   local f="$CUSTOM_FILE"
   [ -f "$f" ] && cp "$f" "${f}.bak.$(date +%s)" 2>/dev/null || true
-  cat > "$f" <<EOF
-UUID=${UUID}
-WS_PATH=${WS_PATH}
-CDN_DOMAIN=${CDN_DOMAIN}
-TLS_SERVER=${TLS_SERVER}
-SINGBOX_PORT=${SINGBOX_PORT}
-NGINX_PORT=${NGINX_PORT}
-NODE_NAME=${NODE_NAME}
-SCRIPT_VERSION=${VERSION}
-IS_ARGO=${IS_ARGO}
-ARGO_DOMAIN=${ARGO_DOMAIN}
-ARGO_AUTH=${ARGO_AUTH}
-EOF
+  # %q shell-escapes every value, so ARGO_AUTH (a JSON blob with spaces and
+  # quotes) survives being sourced back by load_state.
+  {
+    printf 'UUID=%q\n'                 "${UUID:-}"
+    printf 'WS_PATH=%q\n'              "${WS_PATH:-}"
+    printf 'CDN_DOMAIN=%q\n'           "${CDN_DOMAIN:-}"
+    printf 'OWN_DOMAIN=%q\n'           "${OWN_DOMAIN:-}"
+    printf 'TLS_SERVER=%q\n'           "${TLS_SERVER:-}"
+    printf 'SINGBOX_PORT=%q\n'         "${SINGBOX_PORT:-}"
+    printf 'NGINX_PORT=%q\n'           "${NGINX_PORT:-}"
+    printf 'NODE_NAME=%q\n'            "${NODE_NAME:-}"
+    printf 'SCRIPT_VERSION=%q\n'       "${VERSION:-}"
+    printf 'IS_ARGO=%q\n'              "${IS_ARGO:-no}"
+    printf 'ARGO_DOMAIN=%q\n'          "${ARGO_DOMAIN:-}"
+    printf 'ARGO_AUTH=%q\n'            "${ARGO_AUTH:-}"
+    printf 'ARGO_TUNNEL_ID=%q\n'       "${ARGO_TUNNEL_ID:-}"
+    printf 'ARGO_TUNNEL_NAME=%q\n'     "${ARGO_TUNNEL_NAME:-}"
+    printf 'ARGO_CRED_FILE=%q\n'       "${ARGO_CRED_FILE:-}"
+    printf 'ARGO_INGRESS_SERVICE=%q\n' "${ARGO_INGRESS_SERVICE:-}"
+    printf 'ARGO_EXTRA_HOSTS=%q\n'     "${ARGO_EXTRA_HOSTS:-}"
+    printf 'ARGO_CF_ARGS=%q\n'         "${ARGO_CF_ARGS:-}"
+  } > "$f"
 }
 
 load_state() {
@@ -798,23 +996,37 @@ apply_config_file() {
   [ -f "$f" ] || die "config file not found: $f"
   # shellcheck disable=SC1090
   . "$f"
-  # Map user-facing key -> internal key (config.conf uses SERVER for CDN domain,
-  # Xray-style naming kept for compatibility with existing users)
+
+  # Own domain wins over the shared public CDN default.
+  [ -n "${OWN_DOMAIN:-}" ] && CDN_DOMAIN="$OWN_DOMAIN"
+  # SERVER is the historical ArgoX key for the node address.
   [ -n "${SERVER:-}" ] && CDN_DOMAIN="$SERVER"
-  [ -n "${TLS_SERVER:-}" ] && :
+
   [ -n "${UUID:-}" ] && is_uuid "$UUID" || { [ -n "${UUID:-}" ] && die "invalid UUID in config file: $UUID"; }
   [ -n "${WS_PATH:-}" ] && is_ws_path "$WS_PATH" || { [ -n "${WS_PATH:-}" ] && die "invalid WS path: $WS_PATH"; }
   [ -n "${START_PORT:-}" ] && is_port "$START_PORT" || { [ -n "${START_PORT:-}" ] && die "invalid port: $START_PORT"; }
   [ -n "${NGINX_PORT:-}" ] && is_port "$NGINX_PORT" || { [ -n "${NGINX_PORT:-}" ] && die "invalid port: $NGINX_PORT"; }
-  [ -n "${NODE_NAME:-}" ] && :
   [ "${L:-}" = 'E' ] && LANG_TAG='E'
-  # Argo settings
+
   case "${ARGO:-}" in
     y|yes|Y|Yes|1|true|True) IS_ARGO='yes' ;;
+    n|no|N|No|0|false|False)  IS_ARGO='no'  ;;
   esac
-  [ -n "${ARGO_DOMAIN:-}" ] && :
-  [ -n "${ARGO_AUTH:-}" ] && :
+
+  # Argo tunnel parameters (all optional)
+  [ -n "${ARGO_DOMAIN:-}" ]          && :
+  [ -n "${ARGO_AUTH:-}" ]            && :
+  [ -n "${ARGO_TUNNEL_ID:-}" ]       && :
+  [ -n "${ARGO_TUNNEL_NAME:-}" ]     && :
+  [ -n "${ARGO_INGRESS_SERVICE:-}" ] && :
+  [ -n "${ARGO_EXTRA_HOSTS:-}" ]     && :
+  [ -n "${ARGO_CF_ARGS:-}" ]         && :
+  if [ -n "${ARGO_CRED_FILE:-}" ]; then
+    [ -s "$ARGO_CRED_FILE" ] || warning "$(t "ARGO_CRED_FILE does not exist: ${ARGO_CRED_FILE}" "ARGO_CRED_FILE 不存在: ${ARGO_CRED_FILE}")"
+  fi
+
   [ -n "${SINGBOX_VERSION:-}" ] && SINGBOX_DEFAULT_VERSION="$SINGBOX_VERSION"
+  return 0
 }
 
 # ============================================================
@@ -853,11 +1065,14 @@ collect_params() {
     done
   fi
 
-  # CDN domain
+  # Node address: own domain takes priority, then CDN_DOMAIN, then public default
+  [ -z "$CDN_DOMAIN" ] && [ -n "$OWN_DOMAIN" ] && CDN_DOMAIN="$OWN_DOMAIN"
   if [ -z "$CDN_DOMAIN" ]; then
     CDN_DOMAIN="$DEFAULT_CDN_DOMAIN"
-    hint "$(t "CDN domain (default ${CDN_DOMAIN})" "CDN 域名（默认: ${CDN_DOMAIN}）")"
-    hint "$(t "Hint: ${CDN_DOMAIN_HINT[*]}" "候选: ${CDN_DOMAIN_HINT[*]}")"
+    hint "$(t "Node domain — your own domain (e.g. node.example.com) or a public CDN" \
+              "节点域名 —— 你自己的域名（如 node.example.com）或公共 CDN")"
+    hint "$(t "Public CDN examples: ${CDN_DOMAIN_HINT[*]}" "公共 CDN 示例: ${CDN_DOMAIN_HINT[*]}")"
+    hint "$(t "Press Enter to accept the default: ${CDN_DOMAIN}" "回车接受默认值: ${CDN_DOMAIN}")"
     reading "  > " _in
     [ -n "$_in" ] && CDN_DOMAIN="$_in"
     while ! is_domain "$CDN_DOMAIN"; do
@@ -867,6 +1082,7 @@ collect_params() {
       CDN_DOMAIN="$_in"
     done
   fi
+  OWN_DOMAIN="$CDN_DOMAIN"
 
   # TLS server name (SNI for TLS termination)
   if [ -z "$TLS_SERVER" ]; then
@@ -971,6 +1187,7 @@ install_flow() {
   info "$(t "Installing systemd services..." "写入 systemd 服务...")"
   write_singbox_service
   write_nginx_service
+  write_logrotate_config
   systemctl daemon-reload
 
   open_port "$NGINX_PORT" tcp
@@ -996,8 +1213,9 @@ install_flow() {
   # Optional Cloudflare Argo Tunnel
   if [ "$IS_ARGO" = 'yes' ]; then
     info "$(t 'Setting up Cloudflare Argo Tunnel...' '设置 Cloudflare Argo 隧道...')"
-    if [ -z "$ARGO_AUTH" ] && [ -z "$ARGO_DOMAIN" ]; then
-      hint "$(t 'Argo mode enabled but no ARGO_AUTH/ARGO_DOMAIN provided. Skipping Argo setup. Configure later via menu option 7.' 'Argo 模式已启用但未提供 ARGO_AUTH/ARGO_DOMAIN。跳过 Argo 设置。之后可通过菜单选项 7 配置。')"
+    if [ -z "$ARGO_AUTH" ] && [ -z "$ARGO_DOMAIN" ] && [ -z "${ARGO_TUNNEL_NAME:-}" ] && [ -z "${ARGO_CRED_FILE:-}" ]; then
+      hint "$(t 'Argo enabled but no tunnel parameters yet. Menu [7] -> [3] lets you fill in your own domain, tunnel ID/name, credentials file and ingress.' \
+                'Argo 已启用但还没有隧道参数。菜单 [7] -> [3] 可填写你自己的域名、隧道 ID/名称、凭据文件与转发地址。')"
     else
       enable_argo || warning "$(t 'Argo setup failed (see messages above). Standard CDN mode still works.' 'Argo 设置失败（见上方提示）。标准 CDN 模式仍可使用。')"
     fi
@@ -1016,18 +1234,27 @@ install_flow() {
 # ============================================================
 display_node_info() {
   load_state || die "$(t 'Not installed. Run install first.' '尚未安装，请先执行安装。')"
-  local link sub_b64 sub_sr
-  link=$(vmess_share_link "$UUID" "$WS_PATH" "$CDN_DOMAIN")
-  sub_b64="https://${CDN_DOMAIN}/${UUID}/subscribe/base64"
-  sub_sr="https://${CDN_DOMAIN}/${UUID}/subscribe/shadowrocket"
+  local link sub_b64 sub_sr node_host mode
+  # In Argo mode the client dials the tunnel hostname, not the CDN domain.
+  node_host="$CDN_DOMAIN"
+  mode="VMess + WebSocket + TLS + CDN"
+  if [ "$IS_ARGO" = 'yes' ] && [ -n "$ARGO_DOMAIN" ]; then
+    node_host="$ARGO_DOMAIN"
+    mode="VMess + WebSocket + TLS + Argo Tunnel"
+  fi
+
+  link=$(vmess_share_link "$UUID" "$WS_PATH" "$node_host")
+  sub_b64="https://${node_host}/${UUID}/subscribe/base64"
+  sub_sr="https://${node_host}/${UUID}/subscribe/shadowrocket"
 
   title "=============== $(t 'Node Information' '节点信息') ==============="
   info "  $(t 'Name       ' '节点名称     '):  ${NODE_NAME}"
-  info "  $(t 'Address    ' '地址         '):  ${CDN_DOMAIN}:443"
-  info "  $(t 'Protocol   ' '协议         '):  VMess + WebSocket + TLS + CDN"
+  info "  $(t 'Address    ' '地址         '):  ${node_host}:443"
+  info "  $(t 'Protocol   ' '协议         '):  ${mode}"
   info "  $(t 'UUID       ' 'UUID         '):  ${UUID}"
   info "  $(t 'WS Path    ' 'WebSocket 路径'):  /${WS_PATH}"
   info "  $(t 'TLS SNI    ' 'TLS SNI      '):  ${TLS_SERVER}"
+  [ "$IS_ARGO" = 'yes' ] && info "  $(t 'Argo tunnel' 'Argo 隧道    '):  ${ARGO_DOMAIN:-$(t 'not configured' '未配置')}"
   echo
   cyan "  $(t 'VMess share link:' 'VMess 分享链接:')"; echo
   echo "    ${link}"
@@ -1137,7 +1364,8 @@ uninstall() {
   systemctl disable "$SERVICE_NAME" "$NGINX_SERVICE" "$ARGO_SERVICE" 2>/dev/null
   rm -f /etc/systemd/system/${SERVICE_NAME}.service \
         /etc/systemd/system/${NGINX_SERVICE}.service \
-        /etc/systemd/system/${ARGO_SERVICE}.service
+        /etc/systemd/system/${ARGO_SERVICE}.service \
+        /etc/logrotate.d/argox-sing-box
   systemctl daemon-reload
   rm -rf "$WORK_DIR"
   info "$(t 'ArgoX-Lite has been uninstalled.' 'ArgoX-Lite 已卸载。')"
@@ -1178,8 +1406,8 @@ menu() {
    [3] 更新 sing-box (Update)
    [4] 重新配置    (Reconfigure parameters)
    [5] 查看日志    (Tail logs)
-   [7] Argo 隧道  (Cloudflare Argo Tunnel)
    [6] 卸载        (Uninstall)
+   [7] Argo 隧道  (Cloudflare Argo Tunnel)
    [0] 退出        (Exit)
 MENU
   else
@@ -1197,17 +1425,7 @@ MENU
     3) update_singbox; pause ;;
     4) reconfigure; pause ;;
     5) view_logs; pause ;;
-    7) if [ "$IS_ARGO" = 'yes' ]; then
-         disable_argo; save_state;
-       else
-         IS_ARGO='yes'; save_state;
-         if [ -z "$ARGO_AUTH" ] && [ -z "$ARGO_DOMAIN" ]; then
-           hint "$(t 'Provide ARGO_AUTH or ARGO_DOMAIN in config, then run menu 7 again.' '请在配置中提供 ARGO_AUTH 或 ARGO_DOMAIN，然后再次进入菜单选项 7。')"
-         else
-           enable_argo || true
-         fi
-       fi
-       pause ;;
+    7) argo_menu ;;
     6) uninstall; pause ;;
     0) exit 0 ;;
     *) warning "$(t 'Invalid choice.' '非法输入。')"; pause; menu ;;

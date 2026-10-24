@@ -142,10 +142,10 @@ bash argox.sh -u
 | 1 | 查看节点信息（UUID/WS 路径/分享链接/订阅 URL） |
 | 2 | 重启服务（sing-box + nginx + cloudflared） |
 | 3 | 更新 sing-box 到最新 |
-| 4 | 重新配置参数（UUID/WS/CDN/端口等） |
+| 4 | 重新配置参数（UUID/WS/域名/端口等） |
 | 5 | 查看日志（sing-box + nginx + cloudflared） |
-| 7 | Argo 隧道（启用/禁用） |
 | 6 | 卸载 |
+| 7 | Argo 隧道子菜单（启用/禁用/编辑隧道参数/查看配置） |
 | 0 | 退出 |
 
 ## 文件位置
@@ -316,57 +316,131 @@ bash argox.sh -l C    # Chinese (default)
 
 需要 443 端口能正常反代到 VPS 的 `NGINX_PORT`，并支持 WebSocket（大多数反代网关默认支持）。
 
-### 7. Cloudflare Argo Tunnel（可选）
+### 7. Cloudflare Argo Tunnel（可选，支持自有隧道）
 
-如果你不想配置 DNS / CDN，或希望通过 Cloudflare Tunnel 接入，可启用 Argo 模式。
+如果你不想自己配 DNS / CDN，或者已经在 Cloudflare 建好了自己的隧道，可以启用 Argo 模式。**所有隧道参数都可以自己填**，不依赖脚本预设。
 
 **启用方式**
 
 ```bash
-# 方式 1：CLI 一次性启用（需 config.conf 里已有 ARGO_AUTH）
+# 方式 1：CLI 一次性启用
 bash argox.sh -a -f config.conf
 
-# 方式 2：菜单交互（安装后）
+# 方式 2：菜单交互
 bash argox.sh
-# 选择 7 → Argo 隧道
+# 选 [7] Argo 隧道 -> [1] 启用 / [3] 编辑隧道参数
 ```
 
-**配置 ARGO_AUTH**（三种格式任选一）：
+菜单 [7] 是一个子菜单：
 
-1. **JSON（推荐）**：从 Cloudflare Zero Trust 控制台或第三方工具导出完整 JSON（含 `TunnelSecret` / `TunnelID` / `AccountTag`）。
+```
+[1] 启用 Argo 隧道
+[2] 禁用 Argo 隧道
+[3] 编辑隧道参数   ← 自有域名 / 隧道 ID / 凭据 / ingress 都在这里
+[4] 查看当前配置
+[0] 返回
+```
+
+**自有域名（`OWN_DOMAIN`）**
+
+节点地址不再写死公共 CDN。填你自己的域名即可：
+
+```bash
+OWN_DOMAIN='node.example.com'
+```
+
+优先级：`OWN_DOMAIN` > `SERVER`（旧字段）> 公共 CDN 默认值。这个值会用于 VMess 分享链接、订阅地址和 nginx `server_name`。
+
+启用 Argo 后，节点地址自动切换为 `ARGO_DOMAIN`（未设则回退到 `OWN_DOMAIN`），分享链接里的 `add` / `host` / `sni` 全部跟着变。
+
+**自有隧道参数（全部可选）**
+
+| 变量 | 作用 | 默认 |
+|---|---|---|
+| `ARGO_DOMAIN` | 隧道对外域名 | 回退到 `OWN_DOMAIN` |
+| `ARGO_AUTH` | 凭据 JSON（含 `TunnelSecret`）或隧道 Token | 无 |
+| `ARGO_TUNNEL_ID` | 直接指定隧道 ID | 从 `ARGO_AUTH` 的 `TunnelID` 读 |
+| `ARGO_TUNNEL_NAME` | 隧道名，用于 `cloudflared tunnel run <name>` | 无 |
+| `ARGO_CRED_FILE` | 复用已有的凭据 JSON（绝对路径） | `$WORK_DIR/tunnel.json` |
+| `ARGO_INGRESS_SERVICE` | `tunnel.yml` 里 ingress 的本地目标 | `http://localhost:$NGINX_PORT` |
+| `ARGO_EXTRA_HOSTS` | 同一隧道再挂的额外域名（空格分隔） | 无 |
+| `ARGO_CF_ARGS` | 追加到 cloudflared 启动命令末尾的参数 | 无 |
+
+**隧道标识的解析顺序**：`ARGO_TUNNEL_ID` → `ARGO_AUTH` 里的 `TunnelID` → `ARGO_TUNNEL_NAME`。三者都为空会明确报错，不会生成半成品配置。
+
+**三种认证方式（`ARGO_AUTH`，任选一）**
+
+1. **凭据 JSON（推荐）** — 从 Cloudflare Zero Trust 控制台导出：
 
    ```bash
-   ARGO_AUTH='{"AccountTag":"xxxxxxxxxxxxxxxxxxxxxxxxxxxx","TunnelSecret":"eyJhIjoiOWNj...","TunnelID":"01234567-89ab-cdef-0123-456789abcdef"}'
+   ARGO_AUTH='{"AccountTag":"xxxx","TunnelSecret":"eyJhIjoiOWNj...","TunnelID":"01234567-89ab-cdef-0123-456789abcdef"}'
    ```
 
-2. **Token**：Base64 风格的 Tunnel Token（120-250 字符），如 `eyJhIjoiOWNj...`。
+2. **隧道 Token** — Base64 风格，120-250 字符：
 
-3. **API Token**（40 字符）：需要 Cloudflare Custom API Token，权限包括：
-   - Account > Cloudflare One Connectors: cloudflared > Edit
-   - Zone > DNS > Edit
-   - Zone Resources: Include > Specific zone > Argo Root Domain
+   ```bash
+   ARGO_AUTH='eyJhIjoiOWNj...'
+   ```
 
-   注意：ArgoX-Lite 不支持用 API Token **自动创建**隧道；你需要先在 Cloudflare 控制台手动创建隧道，再用 JSON 或 Token 模式接入。
+3. **复用已有凭据文件** — 不填 `ARGO_AUTH`，改填路径：
 
-**配置 ARGO_DOMAIN**：
+   ```bash
+   ARGO_CRED_FILE='/etc/cloudflared/my-tunnel.json'
+   ```
 
-Argo 隧道的接入域名，如 `my-node.example.com`。启用 Argo 后，客户端连接 `ARGO_DOMAIN:443`，流量经 cloudflared 转发到本机 nginx。
+   脚本会从该文件读凭据，并在 `tunnel.yml` 的 `credentials-file` 里引用它，**不会覆盖你的原文件**。
 
-**运行流程**：
+**自己写 ingress（`ARGO_INGRESS_SERVICE` + `ARGO_EXTRA_HOSTS`）**
+
+默认把隧道域名转发到本机 nginx。想改目标端口，或一个隧道挂多个域名：
+
+```bash
+ARGO_DOMAIN='node.example.com'
+ARGO_EXTRA_HOSTS='node2.example.com node3.example.com'
+ARGO_INGRESS_SERVICE='http://127.0.0.1:8080'
+```
+
+生成的 `/etc/argox/tunnel.yml`：
+
+```yaml
+tunnel: <隧道ID>
+credentials-file: /etc/argox/tunnel.json
+
+ingress:
+  - hostname: node.example.com
+    service: http://127.0.0.1:8080
+  - hostname: node2.example.com
+    service: http://127.0.0.1:8080
+  - hostname: node3.example.com
+    service: http://127.0.0.1:8080
+
+  - service: http_status:404
+```
+
+**额外 cloudflared 参数（`ARGO_CF_ARGS`）**
+
+```bash
+ARGO_CF_ARGS='--loglevel debug --protocol http2'
+```
+
+**运行流程**
 
 ```
-Client → ARGO_DOMAIN (Cloudflare 边缘) → cloudflared (VPS) → nginx (127.0.0.1:NGINX_PORT) → sing-box (127.0.0.1:SINGBOX_PORT)
+Client → ARGO_DOMAIN:443 (Cloudflare 边缘)
+       → cloudflared (本机 systemd 服务)
+       → nginx 127.0.0.1:NGINX_PORT (TLS 终止 + WS 反代)
+       → sing-box 127.0.0.1:SINGBOX_PORT (VMess + WS inbound)
 ```
 
-- nginx 负责 TLS 终止与 WebSocket 反代（与普通 CDN 模式完全一致）。
-- cloudflared 负责建立到 Cloudflare 的加密隧道。
-- 启用 Argo 后，`CDN_DOMAIN` 不再使用；节点分享链接使用 `ARGO_DOMAIN`。
+- nginx 的角色与普通 CDN 模式完全一致：TLS 终止 + WebSocket 反代。
+- cloudflared 只负责把 Cloudflare 的流量桥接到本机 nginx。
+- 所以 Argo 模式和 CDN 模式**共用同一套 sing-box + nginx 配置**，切换只改节点域名。
 
-**服务管理**：
+**服务管理**
 
-- `systemctl status cloudflared` 查看状态。
-- `journalctl -u cloudflared -n 50` 查看日志。
-- 菜单选项 7 可切换启用/禁用 Argo。
+- `systemctl status cloudflared` — 状态
+- `journalctl -u cloudflared -n 50` — 日志
+- 菜单 [7] → [4] 可查看当前所有隧道参数与生成的 `tunnel.yml`
 
 ## 配置文件
 
@@ -375,11 +449,16 @@ Client → ARGO_DOMAIN (Cloudflare 边缘) → cloudflared (VPS) → nginx (127.
 - `/etc/argox/cert.pem` / `/etc/argox/key.pem` — 自签 TLS 证书
 - `/etc/argox/subscribe/base64` — SFA 订阅文件
 - `/etc/argox/subscribe/shadowrocket` — Shadowrocket 订阅文件
-- `/etc/argox/custom` — 用户参数（UUID / WS_PATH / CDN_DOMAIN / 端口等）
+- `/etc/argox/custom` — 用户参数（UUID / 域名 / 端口 / 全部 Argo 参数）
 - `/etc/argox/sing-box.log` — sing-box 运行日志
 - `/etc/argox/nginx-error.log` — nginx 错误日志
+- `/etc/argox/tunnel.yml` — cloudflared 隧道配置（Argo 模式，自动生成）
+- `/etc/argox/tunnel.json` — 隧道凭据（Argo 模式；若设了 `ARGO_CRED_FILE` 则引用外部文件）
+- `/etc/argox/cloudflared` — cloudflared 二进制（Argo 模式）
 - `/etc/systemd/system/sing-box.service` — sing-box 服务
 - `/etc/systemd/system/argox-nginx.service` — nginx 服务
+- `/etc/systemd/system/cloudflared.service` — cloudflared 服务（Argo 模式）
+- `/etc/logrotate.d/argox-sing-box` — 日志轮转（sing-box 自身不做轮转）
 
 ## 故障排查
 
