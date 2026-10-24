@@ -943,13 +943,11 @@ install_flow() {
 
   # Optional Cloudflare Argo Tunnel
   if [ "$IS_ARGO" = 'yes' ]; then
-    info "$(t "Setting up Cloudflare Argo Tunnel..." "设置 Cloudflare Argo 隧道...')"
+    info "$(t 'Setting up Cloudflare Argo Tunnel...' '设置 Cloudflare Argo 隧道...')"
     if [ -z "$ARGO_AUTH" ] && [ -z "$ARGO_DOMAIN" ]; then
-      hint "$(t "Argo mode enabled but no ARGO_AUTH/ARGO_DOMAIN provided. Skipping Argo setup. Configure later via menu option 7." \
-                  "Argo 模式已启用但未提供 ARGO_AUTH/ARGO_DOMAIN。跳过 Argo 设置。之后可通过菜单选项 7 配置。")"
+      hint "$(t 'Argo mode enabled but no ARGO_AUTH/ARGO_DOMAIN provided. Skipping Argo setup. Configure later via menu option 7.' 'Argo 模式已启用但未提供 ARGO_AUTH/ARGO_DOMAIN。跳过 Argo 设置。之后可通过菜单选项 7 配置。')"
     else
-      enable_argo || warning "$(t 'Argo setup failed (see messages above). Standard CDN mode still works.' \
-                                      'Argo 设置失败（见上方提示）。标准 CDN 模式仍可使用。')"
+      enable_argo || warning "$(t 'Argo setup failed (see messages above). Standard CDN mode still works.' 'Argo 设置失败（见上方提示）。标准 CDN 模式仍可使用。')"
     fi
   fi
 
@@ -1098,6 +1096,11 @@ uninstall() {
 # Menu
 # ============================================================
 menu() {
+  # Non-interactive stdin (EOF) would loop forever on `read`; bail out instead.
+  if [ ! -t 0 ]; then
+    print_help
+    exit 0
+  fi
   clear
   title "=============== ArgoX-Lite  v${VERSION}  ==============="
   [ -f /etc/os-release ] && { . /etc/os-release 2>/dev/null || true; }
@@ -1189,15 +1192,16 @@ parse_args() {
   local opt
   while [ $# -gt 0 ]; do
     opt="$1"
+    shift
     case "$opt" in
-      -h|--help)     print_help; exit 0 ;;
-      -i|--install)  install_flow; exit 0 ;;
+      -h|--help)      print_help; exit 0 ;;
+      -i|--install)   install_flow; exit 0 ;;
       -u|--uninstall) uninstall; exit 0 ;;
-      -v|--update)   update_singbox; exit 0 ;;
-      -n|--node)     display_node_info; exit 0 ;;
-      -a|--argo)     IS_ARGO='yes' ;;
-      -f|--file)     shift; apply_config_file "${1:-}"; install_flow; exit 0 ;;
-      -l|--lang)     shift; case "${1:-}" in C) LANG_TAG='C' ;; E) LANG_TAG='E' ;; esac ;;
+      -v|--update)    update_singbox; exit 0 ;;
+      -n|--node)      display_node_info; exit 0 ;;
+      -a|--argo)      IS_ARGO='yes' ;;
+      -f|--file)      apply_config_file "${1:-}"; shift 2>/dev/null || true; install_flow; exit 0 ;;
+      -l|--lang)      case "${1:-}" in C|c) LANG_TAG='C' ;; E|e) LANG_TAG='E' ;; esac; shift 2>/dev/null || true ;;
       *) die "Unknown option: $opt  (see --help)" ;;
     esac
   done
