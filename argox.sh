@@ -61,9 +61,22 @@ SERVICE_NAME='sing-box'
 NGINX_SERVICE='argox-nginx'
 
 # Cloudflare Argo Tunnel (optional, disabled by default)
-IS_ARGO='no'
+IS_ARGO='yes'
+IS_ARGO_EXPLICIT='no'
 ARGO_SERVICE='cloudflared'
 CLOUDFLARED_MIN_VERSION='2024.3.0'
+
+# Quick tunnel: no credentials needed, cloudflared hands out a random
+# *.trycloudflare.com hostname. This is the historical ArgoX default mode.
+ARGO_METRICS_PORT='20241'
+ARGO_QUICK_HOST=''        # discovered hostname, cached so restarts can reuse it
+
+# Resolved path of the real nginx binary (packages install it outside $WORK_DIR)
+NGINX_BIN=''
+
+# Where TLS terminates: auto = edge (Cloudflare) in tunnel mode, local nginx
+# otherwise. Force with 'yes' (nginx does TLS) or 'no' (plain HTTP, edge does it).
+NGINX_TLS='auto'
 
 # Argo tunnel parameters — all optional, all overridable so you can drive your
 # own pre-created Cloudflare tunnel instead of the script's defaults.
@@ -186,6 +199,21 @@ install_dependencies() {
   command -v jq     >/dev/null || die "jq missing after install"
   command -v nginx  >/dev/null || die "nginx missing after install"
   command -v openssl >/dev/null || die "openssl missing after install"
+  NGINX_BIN=$(nginx_bin) || die "nginx binary not found"
+}
+
+# Locate the system nginx. The systemd unit must ExecStart the real binary —
+# earlier versions pointed at $WORK_DIR/nginx, which never existed, so the
+# service died with 203/EXEC.
+nginx_bin() {
+  local b
+  if [ -n "${NGINX_BIN:-}" ] && [ -x "$NGINX_BIN" ]; then echo "$NGINX_BIN"; return 0; fi
+  b=$(command -v nginx 2>/dev/null) || true
+  if [ -n "$b" ] && [ -x "$b" ]; then echo "$b"; return 0; fi
+  for b in /usr/sbin/nginx /usr/bin/nginx /sbin/nginx /usr/local/nginx/sbin/nginx /usr/local/sbin/nginx; do
+    [ -x "$b" ] && { echo "$b"; return 0; }
+  done
+  return 1
 }
 
 # ============================================================
@@ -368,7 +396,41 @@ EOF
 }
 
 write_nginx_config() {
-  local ws_path=$1 port=$2 uuid=$3
+  local ws_path=$1 port=$2 uuid=$3 mime=''
+  # The mime.types path differs between distros and is absent on some minimal
+  # images; nginx -t fails hard on a missing include, so only add it when real.
+  local m
+  for m in /etc/nginx/mime.types /usr/local/nginx/conf/mime.types /usr/share/nginx/mime.types; do
+    [ -s "$m" ] && { mime="include       $m;"; break; }
+  done
+
+  # TLS placement matters:
+  #   Cloudflare (tunnel or proxied CDN) terminates TLS at its edge and forwards
+  #   PLAIN HTTP to the origin. If nginx listens with `ssl` there, it answers
+  #   400 "plain HTTP request was sent to HTTPS port" for every tunnel request.
+  #   So TLS is only enabled when nothing sits in front of nginx.
+  local tls="${NGINX_TLS:-auto}"
+  case "$tls" in
+    auto) if [ "${IS_ARGO:-yes}" = 'yes' ]; then tls='no'; else tls='yes'; fi ;;
+  esac
+
+  local listen_line http2_line ssl_block
+  if [ "$tls" = 'yes' ]; then
+    listen_line="listen ${NGINX_PORT} ssl;"
+    http2_line='http2 on;'
+    ssl_block="ssl_certificate     ${WORK_DIR}/cert.pem;
+    ssl_certificate_key ${WORK_DIR}/key.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;"
+  else
+    listen_line="listen ${NGINX_PORT};"
+    http2_line=''
+    ssl_block=''
+  fi
+
   cat > "$WORK_DIR/nginx.conf" <<EOF
 user  root;
 worker_processes auto;
@@ -380,7 +442,7 @@ events {
 }
 
 http {
-  include       /etc/nginx/mime.types;
+  ${mime}
   default_type  application/octet-stream;
   access_log    off;
   sendfile      on;
@@ -393,17 +455,11 @@ http {
   }
 
   server {
-    listen ${NGINX_PORT} ssl;
-    http2 on;
+    ${listen_line}
+    ${http2_line}
     server_name _;
 
-    ssl_certificate     ${WORK_DIR}/cert.pem;
-    ssl_certificate_key ${WORK_DIR}/key.pem;
-    ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
-    ssl_prefer_server_ciphers off;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
+    ${ssl_block}
 
     # WebSocket location -> sing-box
     location ~^/${ws_path} {
@@ -423,7 +479,9 @@ http {
     }
 
     # Subscription endpoint (SFA base64 / Shadowrocket)
-    location ~^/${uuid}/subscribe/ {
+    # The capture group is required: without it $1 is empty, alias points at the
+    # directory itself and nginx answers 301 instead of the file.
+    location ~^/${uuid}/subscribe/(.+)\$ {
       default_type  text/plain;
       alias         ${SUBSCRIBE_DIR}/\$1;
       expires 1h;
@@ -473,6 +531,8 @@ EOF
 }
 
 write_nginx_service() {
+  local ng
+  ng=$(nginx_bin) || die "$(t 'nginx binary not found; install nginx first.' '找不到 nginx 二进制，请先安装 nginx。')"
   cat > /etc/systemd/system/${NGINX_SERVICE}.service <<EOF
 [Unit]
 Description=ArgoX-Lite nginx (TLS termination + WS reverse proxy)
@@ -483,10 +543,10 @@ Wants=${SERVICE_NAME}.service
 Type=forking
 User=root
 PIDFile=${WORK_DIR}/nginx.pid
-ExecStartPre=${WORK_DIR}/nginx -c ${WORK_DIR}/nginx.conf -t
-ExecStart=${WORK_DIR}/nginx -c ${WORK_DIR}/nginx.conf
-ExecStop=${WORK_DIR}/nginx -c ${WORK_DIR}/nginx.conf -s quit
-ExecReload=${WORK_DIR}/nginx -c ${WORK_DIR}/nginx.conf -s reload
+ExecStartPre=${ng} -c ${WORK_DIR}/nginx.conf -t
+ExecStart=${ng} -c ${WORK_DIR}/nginx.conf
+ExecStop=${ng} -c ${WORK_DIR}/nginx.conf -s quit
+ExecReload=${ng} -c ${WORK_DIR}/nginx.conf -s reload
 Restart=always
 RestartSec=5
 
@@ -511,9 +571,31 @@ ${WORK_DIR}/sing-box.log {
 EOF
 }
 
+# cloudflared ships raw binaries (no tarball), and the `latest/download` path is
+# not handled by every GitHub mirror — ghfast.top answers it with a 9-byte
+# "Not Found" body while still returning HTTP 200 to curl. So resolve the real
+# tag first, and validate the payload before trusting it.
+latest_cloudflared_version() {
+  local p url tag
+  for p in "${GH_PROXIES[@]}" ''; do
+    url="${p}https://api.github.com/repos/cloudflare/cloudflared/releases/latest"
+    tag=$(curl -fsL --max-time 15 "$url" 2>/dev/null \
+          | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 \
+          | sed 's/.*"\([^"]*\)"$/\1/')
+    [ -n "$tag" ] && { echo "$tag"; return 0; }
+  done
+  return 1
+}
+
+# Real ELF check: the first four bytes must be 7f 45 4c 46.
+is_elf_file() {
+  [ -s "$1" ] || return 1
+  [ "$(head -c 4 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = '7f454c46' ]
+}
+
 download_cloudflared() {
-  local ver="${1:-latest}"
-  local arch pkg
+  local ver="${1:-}"
+  local arch pkg tag
   case "$ARCH" in
     amd64)   arch='amd64' ;;
     arm64)   arch='arm64' ;;
@@ -525,34 +607,49 @@ download_cloudflared() {
   pkg="cloudflared-linux-${arch}"
 
   cd "$WORK_DIR" || die "cannot cd $WORK_DIR"
-  [ -x cloudflared ] && mv cloudflared "cloudflared.$(date +%s).bak" 2>/dev/null
+  [ -f cloudflared ] && mv cloudflared "cloudflared.$(date +%s).bak" 2>/dev/null
 
-  # Try GitHub releases first (with proxy fallbacks), fall back to Cloudflare's own CDN
-  local urls=(
-    "https://github.com/cloudflare/cloudflared/releases/latest/download/${pkg}"
-    "https://github.com/cloudflare/cloudflared/releases/download/${ver}/${pkg}"
-  )
-  local url
-  for proxy in "${GH_PROXIES[@]}"; do
+  # Prefer an explicit version, then the real latest tag, then the moving path.
+  local urls=()
+  [ -n "$ver" ] && [ "$ver" != 'latest' ] && \
+    urls+=("https://github.com/cloudflare/cloudflared/releases/download/${ver}/${pkg}")
+  tag=$(latest_cloudflared_version) && [ -n "$tag" ] && \
+    urls+=("https://github.com/cloudflare/cloudflared/releases/download/${tag}/${pkg}")
+  urls+=("https://github.com/cloudflare/cloudflared/releases/latest/download/${pkg}")
+
+  local proxy url tmp="${pkg}.tmp"
+  for proxy in "${GH_PROXIES[@]}" ''; do
     for url in "${urls[@]}"; do
-      info "Downloading cloudflared ... ${proxy}${url}"
-      if curl -sL --max-time 90 --retry 2 --retry-delay 2 "${proxy}${url}" -o "${pkg}.tmp" 2>/dev/null && [ -s "${pkg}.tmp" ]; then
-        mv "${pkg}.tmp" cloudflared
-        chmod +x cloudflared
+      if [ -n "$proxy" ]; then
+        info "Downloading cloudflared ... ${proxy}${url}"
+      else
+        info "Downloading cloudflared ... ${url}"
+      fi
+      rm -f "$tmp"
+      if ! curl -fL --max-time 180 --retry 2 --retry-delay 2 --connect-timeout 15 \
+           "${proxy}${url}" -o "$tmp" 2>/dev/null; then
+        continue
+      fi
+      if ! is_elf_file "$tmp"; then
+        warning "  not an ELF binary ($(wc -c < "$tmp" 2>/dev/null) bytes), trying next"
+        rm -f "$tmp"
+        continue
+      fi
+      mv "$tmp" cloudflared
+      chmod +x cloudflared
+      # Last gate: it must actually run.
+      if "$WORK_DIR/cloudflared" --version >/dev/null 2>&1; then
         return 0
       fi
+      warning "  downloaded cloudflared will not execute, trying next"
+      rm -f cloudflared
     done
   done
-  # Direct download (no proxy)
-  for url in "${urls[@]}"; do
-    info "Downloading cloudflared ... ${url}"
-    if curl -sL --max-time 90 --retry 2 --retry-delay 2 "$url" -o "${pkg}.tmp" 2>/dev/null && [ -s "${pkg}.tmp" ]; then
-      mv "${pkg}.tmp" cloudflared
-      chmod +x cloudflared
-      return 0
-    fi
-  done
-  die "failed to download cloudflared"
+
+  local bak
+  bak=$(ls -1t cloudflared.*.bak 2>/dev/null | head -1)
+  [ -n "$bak" ] && mv -f "$bak" cloudflared
+  die "$(t 'failed to download cloudflared' '下载 cloudflared 失败')"
 }
 
 cloudflared_version_of() {
@@ -632,6 +729,7 @@ write_tunnel_yml() {
 write_cloudflared_service() {
   local cf="$WORK_DIR/cloudflared"
   local runs='' extra="${ARGO_CF_ARGS:-}"
+  local target="${ARGO_INGRESS_SERVICE:-http://localhost:${NGINX_PORT}}"
 
   if [ -n "${ARGO_TOKEN:-}" ]; then
     # Token mode: the tunnel is fully described by the token.
@@ -643,9 +741,12 @@ write_cloudflared_service() {
     # Fall back to a locally-registered tunnel (cert.pem based).
     runs="$cf tunnel --no-autoupdate run ${ARGO_TUNNEL_NAME}${extra:+ $extra}"
   else
-    warning "$(t 'No tunnel.yml, token, or tunnel name; cannot write cloudflared service.' \
-                 '缺少 tunnel.yml / token / 隧道名，无法写入 cloudflared 服务。')"
-    return 1
+    # Quick tunnel: no account, no credentials. Cloudflare hands out a random
+    # *.trycloudflare.com hostname, which we read back from the metrics API.
+    # This is the historical ArgoX default mode.
+    runs="$cf tunnel --no-autoupdate --url ${target} --metrics 127.0.0.1:${ARGO_METRICS_PORT}${extra:+ $extra}"
+    info "$(t 'Quick tunnel mode (no credentials): random *.trycloudflare.com hostname' \
+             '快速隧道模式（无需凭据）：使用随机 *.trycloudflare.com 域名')"
   fi
 
   # Type=simple already tracks the cloudflared process, so no PID file and no
@@ -678,7 +779,9 @@ enable_argo() {
   cfver=$(cloudflared_version_of "$WORK_DIR/cloudflared")
   info "$(t "cloudflared v${cfver} installed" "cloudflared v${cfver} 已安装")"
 
-  # 2. Credentials: ARGO_AUTH, an existing ARGO_CRED_FILE, or a bare token
+  # 2. Work out which mode we are in.
+  #    Credentials present  -> named tunnel (your own tunnel + your own domain)
+  #    Nothing configured   -> quick tunnel (*.trycloudflare.com, no account)
   if [ -z "$ARGO_AUTH" ] && [ -n "${ARGO_CRED_FILE:-}" ] && [ -s "$ARGO_CRED_FILE" ]; then
     ARGO_AUTH=$(tr -d '\n' < "$ARGO_CRED_FILE")
     info "$(t "Using existing credentials: ${ARGO_CRED_FILE}" "使用已有凭据文件: ${ARGO_CRED_FILE}")"
@@ -689,38 +792,47 @@ enable_argo() {
   if [ -n "$ARGO_AUTH" ]; then
     parse_argo_auth "$ARGO_AUTH" || die "$(t 'ARGO_AUTH parse failed. Provide JSON with TunnelSecret, or a 120-250 char token.' \
                                               'ARGO_AUTH 解析失败。需提供含 TunnelSecret 的 JSON，或 120-250 字符 Token。')"
-  elif [ -z "${ARGO_TUNNEL_NAME:-}" ]; then
-    die "$(t 'Nothing to run: set ARGO_AUTH, ARGO_CRED_FILE, or ARGO_TUNNEL_NAME.' \
-           '无法启动：请设置 ARGO_AUTH、ARGO_CRED_FILE 或 ARGO_TUNNEL_NAME。')"
   fi
 
-  # 3. Hostname (own domain). Prefer explicit ARGO_DOMAIN, else OWN_DOMAIN,
-  #    else whatever a previous tunnel.yml already declared.
-  if [ -z "$ARGO_DOMAIN" ] && [ -n "${OWN_DOMAIN:-}" ]; then
-    ARGO_DOMAIN="$OWN_DOMAIN"
+  local has_creds='no' quick='no'
+  if [ -n "$ARGO_AUTH" ] || [ -n "${ARGO_TOKEN:-}" ] || [ -n "${ARGO_TUNNEL_NAME:-}" ] \
+     || [ -n "${ARGO_TUNNEL_ID:-}" ] || [ -n "${ARGO_CRED_FILE:-}" ]; then
+    has_creds='yes'
   fi
-  if [ -z "$ARGO_DOMAIN" ] && [ -s "$WORK_DIR/tunnel.yml" ]; then
-    ARGO_DOMAIN=$(awk '/^[[:space:]]*- hostname:/{print $3; exit}' "$WORK_DIR/tunnel.yml")
-  fi
-  if [ -z "$ARGO_DOMAIN" ] && [ -n "${ARGO_TOKEN:-}" ]; then
-    # Token mode carries its own hostname; nothing to write.
-    info "$(t 'Token mode: hostname comes from the Cloudflare tunnel config.' \
-             'Token 模式：域名由 Cloudflare 侧隧道配置决定。')"
-  elif [ -z "$ARGO_DOMAIN" ]; then
-    warning "$(t 'No tunnel hostname: set ARGO_DOMAIN or OWN_DOMAIN (your own domain).' \
-                 '缺少隧道域名：请设置 ARGO_DOMAIN 或 OWN_DOMAIN（你自己的域名）。')"
-    return 1
-  fi
+  [ "$has_creds" = 'no' ] && quick='yes'
 
-  # 4. Write credentials + tunnel.yml (skipped in token mode)
-  if [ -z "${ARGO_TOKEN:-}" ] && [ -n "$ARGO_DOMAIN" ]; then
-    if [ -n "$ARGO_JSON" ] && [ -z "${ARGO_CRED_FILE:-}" ]; then
-      write_cloudflared_credentials
+  # 3. Hostname. Named tunnels need one; quick tunnels get it from Cloudflare.
+  if [ "$quick" = 'no' ]; then
+    if [ -z "$ARGO_DOMAIN" ] && [ -n "${OWN_DOMAIN:-}" ]; then
+      ARGO_DOMAIN="$OWN_DOMAIN"
     fi
-    write_tunnel_yml "$ARGO_DOMAIN" "$NGINX_PORT" \
-      || die "$(t 'Failed to write tunnel.yml.' '写入 tunnel.yml 失败。')"
-    info "$(t "tunnel.yml: tunnel=${ARGO_TUNNEL_ID} host=${ARGO_DOMAIN} -> ${ARGO_INGRESS_SERVICE:-http://localhost:${NGINX_PORT}}" \
-             "tunnel.yml: 隧道=${ARGO_TUNNEL_ID} 域名=${ARGO_DOMAIN} -> ${ARGO_INGRESS_SERVICE:-http://localhost:${NGINX_PORT}}")"
+    if [ -z "$ARGO_DOMAIN" ] && [ -s "$WORK_DIR/tunnel.yml" ]; then
+      ARGO_DOMAIN=$(awk '/^[[:space:]]*- hostname:/{print $3; exit}' "$WORK_DIR/tunnel.yml")
+    fi
+    if [ -z "$ARGO_DOMAIN" ] && [ -n "${ARGO_TOKEN:-}" ]; then
+      info "$(t 'Token mode: hostname comes from the Cloudflare tunnel config.' \
+               'Token 模式：域名由 Cloudflare 侧隧道配置决定。')"
+      hint "$(t "Make sure the tunnel's Public Hostname points at http://localhost:${NGINX_PORT} — a mismatch shows up as HTTP 502." \
+                "请确认 Cloudflare 控制台里该隧道的 Public Hostname 指向 http://localhost:${NGINX_PORT} —— 不一致会表现为 HTTP 502。")"
+    elif [ -z "$ARGO_DOMAIN" ]; then
+      warning "$(t 'Named tunnel needs a hostname: set ARGO_DOMAIN or OWN_DOMAIN.' \
+                   '命名隧道需要域名：请设置 ARGO_DOMAIN 或 OWN_DOMAIN。')"
+      return 1
+    fi
+
+    # 4. Write credentials + tunnel.yml (skipped in token mode)
+    if [ -z "${ARGO_TOKEN:-}" ] && [ -n "$ARGO_DOMAIN" ]; then
+      if [ -n "$ARGO_JSON" ] && [ -z "${ARGO_CRED_FILE:-}" ]; then
+        write_cloudflared_credentials
+      fi
+      write_tunnel_yml "$ARGO_DOMAIN" "$NGINX_PORT" \
+        || die "$(t 'Failed to write tunnel.yml.' '写入 tunnel.yml 失败。')"
+      info "$(t "tunnel.yml: tunnel=${ARGO_TUNNEL_ID} host=${ARGO_DOMAIN} -> ${ARGO_INGRESS_SERVICE:-http://localhost:${NGINX_PORT}}" \
+               "tunnel.yml: 隧道=${ARGO_TUNNEL_ID} 域名=${ARGO_DOMAIN} -> ${ARGO_INGRESS_SERVICE:-http://localhost:${NGINX_PORT}}")"
+    fi
+  else
+    # Quick tunnel: drop any stale tunnel.yml so the service picks the quick path.
+    rm -f "$WORK_DIR/tunnel.yml"
   fi
 
   # 5. Write service
@@ -730,14 +842,51 @@ enable_argo() {
   systemctl daemon-reload
   systemctl enable "$ARGO_SERVICE" 2>/dev/null
   systemctl restart "$ARGO_SERVICE" 2>/dev/null
-  sleep 1
+  sleep 2
   if ! systemctl is-active --quiet "$ARGO_SERVICE"; then
     warning "$(t "cloudflared failed to start. Last log lines:" "cloudflared 启动失败，最近日志:")"
     journalctl -u "$ARGO_SERVICE" -n 20 --no-pager 2>/dev/null
     return 1
   fi
+
+  # 7. Quick tunnel: read back the hostname Cloudflare assigned us.
+  if [ "$quick" = 'yes' ]; then
+    info "$(t 'Waiting for the quick tunnel hostname...' '等待快速隧道分配域名...')"
+    local host
+    host=$(discover_quick_tunnel_host) || host=''
+    if [ -z "$host" ]; then
+      warning "$(t 'Could not read the quick tunnel hostname. Check: journalctl -u cloudflared -n 50' \
+                   '未能获取快速隧道域名。请查看: journalctl -u cloudflared -n 50')"
+      return 1
+    fi
+    ARGO_DOMAIN="$host"
+    ARGO_QUICK_HOST="$host"
+    info "$(t "Quick tunnel hostname: ${ARGO_DOMAIN}" "快速隧道域名: ${ARGO_DOMAIN}")"
+  fi
+
+  # 8. Node address changed, so refresh the subscription files and state.
+  [ -n "${UUID:-}" ] && [ -n "${WS_PATH:-}" ] && \
+    write_subscriptions "$UUID" "$WS_PATH" "$ARGO_DOMAIN" 2>/dev/null || true
+  save_state
+
   info "$(t "Argo Tunnel enabled. Tunnel domain: ${ARGO_DOMAIN}" "Argo 隧道已启用。隧道域名: ${ARGO_DOMAIN}")"
   return 0
+}
+
+# Poll cloudflared's metrics endpoint for the quick-tunnel hostname, falling
+# back to scraping the service journal.
+discover_quick_tunnel_host() {
+  local i host
+  for i in $(seq 1 30); do
+    host=$(curl -s --max-time 3 "http://127.0.0.1:${ARGO_METRICS_PORT}/quicktunnel" 2>/dev/null \
+           | sed -n 's/.*"hostname"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    [ -n "$host" ] && { echo "$host"; return 0; }
+    host=$(journalctl -u "$ARGO_SERVICE" -n 200 --no-pager 2>/dev/null \
+           | grep -oE '[a-z0-9][a-z0-9-]*\.trycloudflare\.com' | head -1)
+    [ -n "$host" ] && { echo "$host"; return 0; }
+    sleep 2
+  done
+  return 1
 }
 
 disable_argo() {
@@ -884,8 +1033,8 @@ validate_singbox_config() {
 
 validate_nginx_config() {
   local bin
-  bin=$(command -v nginx || true)
-  [ -x "$bin" ] || die "nginx binary missing"
+  bin=$(nginx_bin) || die "nginx binary missing"
+  NGINX_BIN="$bin"
   if "$bin" -c "$WORK_DIR/nginx.conf" -t >/dev/null 2>&1; then
     info "$(t 'nginx config OK' 'nginx 配置校验通过')"
     return 0
@@ -978,12 +1127,17 @@ save_state() {
     printf 'ARGO_INGRESS_SERVICE=%q\n' "${ARGO_INGRESS_SERVICE:-}"
     printf 'ARGO_EXTRA_HOSTS=%q\n'     "${ARGO_EXTRA_HOSTS:-}"
     printf 'ARGO_CF_ARGS=%q\n'         "${ARGO_CF_ARGS:-}"
+    printf 'ARGO_QUICK_HOST=%q\n'      "${ARGO_QUICK_HOST:-}"
+    printf 'ARGO_METRICS_PORT=%q\n'    "${ARGO_METRICS_PORT:-20241}"
+    printf 'NGINX_TLS=%q\n'            "${NGINX_TLS:-auto}"
   } > "$f"
 }
 
 load_state() {
   [ -f "$CUSTOM_FILE" ] || return 1
   . "$CUSTOM_FILE"
+  # A saved state already decided the run mode; don't re-ask on reinstall.
+  IS_ARGO_EXPLICIT='yes'
   return 0
 }
 
@@ -1009,8 +1163,8 @@ apply_config_file() {
   [ "${L:-}" = 'E' ] && LANG_TAG='E'
 
   case "${ARGO:-}" in
-    y|yes|Y|Yes|1|true|True) IS_ARGO='yes' ;;
-    n|no|N|No|0|false|False)  IS_ARGO='no'  ;;
+    y|yes|Y|Yes|1|true|True) IS_ARGO='yes'; IS_ARGO_EXPLICIT='yes' ;;
+    n|no|N|No|0|false|False)  IS_ARGO='no';  IS_ARGO_EXPLICIT='yes' ;;
   esac
 
   # Argo tunnel parameters (all optional)
@@ -1129,6 +1283,56 @@ collect_params() {
     reading "  > " _in
     [ -n "$_in" ] && NODE_NAME="$_in"
   fi
+
+  # ---- Run mode -------------------------------------------------------
+  # Tunnel is the default (matches classic ArgoX). Direct CDN stays available.
+  if [ "${IS_ARGO_EXPLICIT:-no}" != 'yes' ]; then
+    echo
+    hint "$(t 'Run mode:' '运行模式:')"
+    hint "$(t '  [1] Cloudflare Argo tunnel  (default, no public IP needed)' \
+              '  [1] Cloudflare Argo 隧道（默认，无需公网 IP）')"
+    hint "$(t '  [2] Direct CDN (point your own domain at this server)' \
+              '  [2] 直连 CDN（把你的域名解析到本机）')"
+    hint "$(t 'Choose [1]: ' '请选择 [1]: ')"
+    reading "  > " _in
+    case "${_in:-1}" in
+      2) IS_ARGO='no' ;;
+      *) IS_ARGO='yes' ;;
+    esac
+  fi
+
+  # ---- Tunnel parameters (only when tunnel mode is on) ----------------
+  if [ "$IS_ARGO" = 'yes' ]; then
+    echo
+    info "$(t 'Tunnel configuration — leave blank to use a quick tunnel (*.trycloudflare.com)' \
+             '隧道配置 —— 留空则使用快速隧道（*.trycloudflare.com）')"
+
+    if [ -z "$ARGO_DOMAIN" ]; then
+      hint "$(t "Tunnel hostname, your own domain [blank = quick tunnel]: " \
+                "隧道域名，你自己的域名 [留空 = 快速隧道]: ")"
+      reading "  > " _in
+      if [ -n "$_in" ]; then
+        if is_domain "$_in"; then ARGO_DOMAIN="$_in"
+        else warning "$(t 'Invalid domain, ignored.' '域名格式非法，已忽略。')"
+        fi
+      fi
+    fi
+
+    if [ -n "$ARGO_DOMAIN" ] && [ -z "$ARGO_AUTH" ] && [ -z "${ARGO_CRED_FILE:-}" ] \
+       && [ -z "${ARGO_TUNNEL_NAME:-}" ]; then
+      hint "$(t "Tunnel credentials JSON or token [blank = set later via menu 7]: " \
+                "隧道凭据 JSON 或 Token [留空 = 稍后用菜单 7 配置]: ")"
+      reading "  > " _in
+      [ -n "$_in" ] && ARGO_AUTH="$_in"
+    fi
+
+    if [ -n "$ARGO_DOMAIN" ] && [ -z "$ARGO_AUTH" ] && [ -z "${ARGO_CRED_FILE:-}" ] \
+       && [ -z "${ARGO_TUNNEL_NAME:-}" ]; then
+      hint "$(t "Tunnel ID (optional) [blank = skip]: " "隧道 ID（可选）[留空 = 跳过]: ")"
+      reading "  > " _in
+      [ -n "$_in" ] && ARGO_TUNNEL_ID="$_in"
+    fi
+  fi
 }
 
 # ============================================================
@@ -1210,15 +1414,11 @@ install_flow() {
     die "nginx did not start"
   }
 
-  # Optional Cloudflare Argo Tunnel
+  # Optional Cloudflare Argo Tunnel (default run mode)
   if [ "$IS_ARGO" = 'yes' ]; then
     info "$(t 'Setting up Cloudflare Argo Tunnel...' '设置 Cloudflare Argo 隧道...')"
-    if [ -z "$ARGO_AUTH" ] && [ -z "$ARGO_DOMAIN" ] && [ -z "${ARGO_TUNNEL_NAME:-}" ] && [ -z "${ARGO_CRED_FILE:-}" ]; then
-      hint "$(t 'Argo enabled but no tunnel parameters yet. Menu [7] -> [3] lets you fill in your own domain, tunnel ID/name, credentials file and ingress.' \
-                'Argo 已启用但还没有隧道参数。菜单 [7] -> [3] 可填写你自己的域名、隧道 ID/名称、凭据文件与转发地址。')"
-    else
-      enable_argo || warning "$(t 'Argo setup failed (see messages above). Standard CDN mode still works.' 'Argo 设置失败（见上方提示）。标准 CDN 模式仍可使用。')"
-    fi
+    enable_argo || warning "$(t 'Argo setup failed (see messages above). Direct CDN mode still works.' \
+                                    'Argo 设置失败（见上方提示）。直连 CDN 模式仍可使用。')"
   fi
 
   save_state
@@ -1255,6 +1455,11 @@ display_node_info() {
   info "  $(t 'WS Path    ' 'WebSocket 路径'):  /${WS_PATH}"
   info "  $(t 'TLS SNI    ' 'TLS SNI      '):  ${TLS_SERVER}"
   [ "$IS_ARGO" = 'yes' ] && info "  $(t 'Argo tunnel' 'Argo 隧道    '):  ${ARGO_DOMAIN:-$(t 'not configured' '未配置')}"
+  if [ "$IS_ARGO" = 'yes' ]; then
+    info "  $(t 'TLS ends at' 'TLS 终止于   '):  Cloudflare $(t 'edge (origin is plain HTTP)' '边缘（回源为明文 HTTP）')"
+  else
+    info "  $(t 'TLS ends at' 'TLS 终止于   '):  $(t 'local nginx' '本机 nginx')"
+  fi
   echo
   cyan "  $(t 'VMess share link:' 'VMess 分享链接:')"; echo
   echo "    ${link}"

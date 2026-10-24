@@ -91,11 +91,14 @@ bash argox.sh
   |---|---|---|
    | UUID | 自动生成 | 36 位 UUID v4 |
    | WS Path | `argox-ws-vm` | WebSocket 路径，仅允许字母/数字/`-_./@` |
-   | CDN Domain | `skk.moe` | 公共 CDN 域名，或你自己的域名 |
+   | 节点域名 | `skk.moe` | **你自己的域名**或公共 CDN |
    | TLS SNI | `addons.mozilla.org` | TLS Server Name |
    | sing-box Port | 自动分配 | 内部监听端口，从 30000 开始找空闲 |
-   | nginx Port | `8080` | 对外端口，CDN 将 443 流量转发到此 |
+   | nginx Port | `8080` | 对外端口，隧道/CDN 转发到此 |
    | Node Name | 主机名 | 节点显示名称 |
+   | **运行模式** | **[1] Argo 隧道** | [1] 隧道（默认）/ [2] 直连 CDN |
+   | 隧道域名 | 留空 | 你自己的域名；留空 = 快速隧道 |
+   | 隧道凭据 | 留空 | 凭据 JSON 或 Token；留空 = 快速隧道 |
 
 4. **安装完成后**
 
@@ -316,9 +319,45 @@ bash argox.sh -l C    # Chinese (default)
 
 需要 443 端口能正常反代到 VPS 的 `NGINX_PORT`，并支持 WebSocket（大多数反代网关默认支持）。
 
-### 7. Cloudflare Argo Tunnel（可选，支持自有隧道）
+### 7. Cloudflare Argo Tunnel（默认运行模式）
 
-如果你不想自己配 DNS / CDN，或者已经在 Cloudflare 建好了自己的隧道，可以启用 Argo 模式。**所有隧道参数都可以自己填**，不依赖脚本预设。
+**隧道是默认模式**，与原版 ArgoX 一致 —— 安装时选 `[1]` 或直接回车即可。直连 CDN 仍可用（选 `[2]`）。
+
+三种跑法，按你填了什么自动判断：
+
+| 情况 | 模式 | 域名来源 |
+|---|---|---|
+| 填了 `ARGO_AUTH` / `ARGO_CRED_FILE` / `ARGO_TUNNEL_NAME` / `ARGO_TUNNEL_ID` | **命名隧道**（你自己的隧道） | 你填的 `ARGO_DOMAIN` |
+| `ARGO_AUTH` 是 Base64 Token（120-250 字符） | **Token 模式** | Cloudflare 控制台里配的 hostname |
+| 什么都不填 | **快速隧道** | cloudflared 随机分配 `*.trycloudflare.com` |
+
+**快速隧道**（零配置，最快验证连通性）
+
+```bash
+bash argox.sh
+# 运行模式选 [1]，隧道域名留空，凭据留空
+```
+
+装完会打印类似：
+
+```
+Quick tunnel hostname: random-words-here.trycloudflare.com
+```
+
+注意：快速隧道**每次重启域名都会变**，脚本会从 cloudflared 的 metrics 端点（`127.0.0.1:20241/quicktunnel`）读回新域名并自动刷新订阅。适合临时测试，长期用请配命名隧道。
+
+**命名隧道**（推荐，域名固定）
+
+1. Cloudflare Zero Trust → Networks → Tunnels → Create a tunnel → Cloudflared
+2. 在隧道里加 Public Hostname：`node.example.com` → `http://localhost:8080`
+3. 复制凭据（JSON 或 Token），安装时粘贴进去
+
+```bash
+OWN_DOMAIN='node.example.com'
+ARGO='y'
+ARGO_DOMAIN='node.example.com'
+ARGO_AUTH='eyJhIjoi...'      # 或完整 JSON
+```
 
 **启用方式**
 
@@ -426,15 +465,26 @@ ARGO_CF_ARGS='--loglevel debug --protocol http2'
 **运行流程**
 
 ```
-Client → ARGO_DOMAIN:443 (Cloudflare 边缘)
+Client → ARGO_DOMAIN:443 (Cloudflare 边缘，TLS 在这里终止)
        → cloudflared (本机 systemd 服务)
-       → nginx 127.0.0.1:NGINX_PORT (TLS 终止 + WS 反代)
+       → nginx 127.0.0.1:NGINX_PORT (明文 HTTP + WebSocket 反代)
        → sing-box 127.0.0.1:SINGBOX_PORT (VMess + WS inbound)
 ```
 
-- nginx 的角色与普通 CDN 模式完全一致：TLS 终止 + WebSocket 反代。
-- cloudflared 只负责把 Cloudflare 的流量桥接到本机 nginx。
-- 所以 Argo 模式和 CDN 模式**共用同一套 sing-box + nginx 配置**，切换只改节点域名。
+**TLS 只在一层终止**，这点很关键：
+
+| 场景 | TLS 终止位置 | nginx |
+|---|---|---|
+| Argo 隧道（默认） | Cloudflare 边缘 | **明文 HTTP** |
+| 直连 CDN（Cloudflare 代理） | Cloudflare 边缘 | **明文 HTTP** |
+| 直连（域名直接解析到本机） | 本机 nginx | 自签 TLS |
+
+`NGINX_TLS=auto`（默认）会按运行模式自动选。如果手动设错，典型症状：
+
+- 隧道模式下 nginx 开了 `ssl` → Cloudflare 回源是明文，nginx 答 **400 plain HTTP request was sent to HTTPS port**
+- 隧道 origin 端口和 `NGINX_PORT` 不一致 → Cloudflare 答 **502**
+
+**⚠️ 端口必须对齐**：用 Token / 命名隧道时，Cloudflare 控制台里该隧道的 **Public Hostname 的 service 必须指向 `http://localhost:<NGINX_PORT>`**。脚本默认 8080；如果你控制台里填的是 8001，就把 `NGINX_PORT` 改成 8001。
 
 **服务管理**
 
