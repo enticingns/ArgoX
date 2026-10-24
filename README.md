@@ -1,11 +1,169 @@
 # ArgoX-Lite
 
-**Sing-box 专用代理部署脚本** — 单一核心、单一节点模式，把原 ArgoX 的 6900+ 行精简为约 980 行。
+**Sing-box 专用代理部署脚本** — 单一核心、单一节点模式，把原 ArgoX 的 6900+ 行精简为约 1200 行。
 
 - 代理核心：**sing-box**（唯一，v1.10+，验证版本 v1.14.4）
 - 节点模式：**VMess + WebSocket + TLS + CDN**（唯一）
 - TLS 终止位置：**nginx**（sing-box 侧仅监听 `127.0.0.1` 的明文 WS）
+- 可选：**Cloudflare Argo Tunnel**（cloudflared 接入）
 - 兼容客户端：Shadowrocket、SFA (sing-box)、v2rayN、v2rayNG、Clash.Meta 等任何支持 VMess + WS 的客户端
+
+## 一键安装
+
+### Linux（推荐）
+
+```bash
+bash <(wget -O- https://raw.githubusercontent.com/enticingns/ArgoX/sing-box-lite/argox.sh)
+```
+
+或使用 curl：
+
+```bash
+bash <(curl -sL https://raw.githubusercontent.com/enticingns/ArgoX/sing-box-lite/argox.sh)
+```
+
+### 带参数
+
+```bash
+# 中文安装（默认）
+bash <(curl -sL https://raw.githubusercontent.com/enticingns/ArgoX/sing-box-lite/argox.sh)
+
+# 英文安装
+bash <(curl -sL https://raw.githubusercontent.com/enticingns/ArgoX/sing-box-lite/argox.sh) -l E
+
+# 启用 Argo 隧道（需提前配置 ARGO_AUTH）
+bash <(curl -sL https://raw.githubusercontent.com/enticingns/ArgoX/sing-box-lite/argox.sh) -a -f config.conf
+
+# 非交互安装
+bash <(curl -sL https://raw.githubusercontent.com/enticingns/ArgoX/sing-box-lite/argox.sh) -f config.conf
+```
+
+### 手动安装
+
+```bash
+# 下载脚本
+wget -O argox.sh https://raw.githubusercontent.com/enticingns/ArgoX/sing-box-lite/argox.sh
+
+# 赋予执行权限
+chmod +x argox.sh
+
+# 运行
+bash argox.sh
+```
+
+## 安装说明
+
+### 系统要求
+
+| 项目 | 要求 |
+|---|---|
+| 操作系统 | Debian/Ubuntu/Kali/Mint, CentOS/RHEL/Rocky/AlmaLinux, Fedora, Arch/Manjaro, Alpine, OpenSUSE |
+| 架构 | x86_64 / ARM64 / ARMv7 / ARMv6 / 32-bit x86 |
+| 服务管理器 | **systemd**（Alpine 默认 OpenRC，需手动适配） |
+| 用户 | **root**（`sudo bash argox.sh` 或 `su -` 后运行） |
+| 网络 | 需能访问 GitHub（下载 sing-box 二进制） |
+
+### 前置条件
+
+脚本会自动安装以下依赖，无需手动准备：
+
+- `curl` 或 `wget`（下载 sing-box）
+- `jq`（JSON 处理）
+- `unzip` / `tar`（解压）
+- `openssl`（生成 TLS 证书）
+- `nginx`（TLS 终止 + WebSocket 反代）
+- `ca-certificates`（CA 证书）
+
+### 完整安装流程
+
+1. **获取脚本**
+   ```bash
+   bash <(curl -sL https://raw.githubusercontent.com/enticingns/ArgoX/sing-box-lite/argox.sh)
+   ```
+
+2. **选择语言**
+   - `C` = 中文（默认）
+   - `E` = 英文
+
+3. **输入节点参数**（均可留空使用默认值）
+
+   | 参数 | 默认值 | 说明 |
+  |---|---|---|
+   | UUID | 自动生成 | 36 位 UUID v4 |
+   | WS Path | `argox-ws-vm` | WebSocket 路径，仅允许字母/数字/`-_./@` |
+   | CDN Domain | `skk.moe` | 公共 CDN 域名，或你自己的域名 |
+   | TLS SNI | `addons.mozilla.org` | TLS Server Name |
+   | sing-box Port | 自动分配 | 内部监听端口，从 30000 开始找空闲 |
+   | nginx Port | `8080` | 对外端口，CDN 将 443 流量转发到此 |
+   | Node Name | 主机名 | 节点显示名称 |
+
+4. **安装完成后**
+
+   脚本会自动：
+   - 下载 sing-box 到 `/etc/argox/sing-box`
+   - 生成 TLS 证书到 `/etc/argox/cert.pem`
+   - 写入 sing-box 配置到 `/etc/argox/config.json`
+   - 写入 nginx 配置到 `/etc/argox/nginx.conf`
+   - 生成订阅文件到 `/etc/argox/subscribe/`
+   - 安装 systemd 服务并启动
+   - 打印节点信息与订阅链接
+
+5. **配置客户端**
+
+   使用打印的订阅链接或直接复制 VMess 分享链接到客户端。
+
+### 卸载
+
+```bash
+bash argox.sh -u
+# 或进入菜单选择 [6] 卸载
+```
+
+## 常用命令速查
+
+| 命令 | 说明 |
+|---|---|
+| `bash argox.sh` | 交互式菜单 |
+| `bash argox.sh -i` | 安装（交互） |
+| `bash argox.sh -f config.conf` | 非交互安装 |
+| `bash argox.sh -a -f config.conf` | 启用 Argo 并安装 |
+| `bash argox.sh -l E` | 英文模式 |
+| `bash argox.sh -n` | 查看节点信息与订阅 |
+| `bash argox.sh -v` | 升级 sing-box |
+| `bash argox.sh -u` | 卸载 |
+| `bash argox.sh -h` | 帮助 |
+
+## 菜单操作
+
+安装后运行 `bash argox.sh` 进入菜单：
+
+| 选项 | 功能 |
+|---|---|
+| 1 | 查看节点信息（UUID/WS 路径/分享链接/订阅 URL） |
+| 2 | 重启服务（sing-box + nginx + cloudflared） |
+| 3 | 更新 sing-box 到最新 |
+| 4 | 重新配置参数（UUID/WS/CDN/端口等） |
+| 5 | 查看日志（sing-box + nginx + cloudflared） |
+| 7 | Argo 隧道（启用/禁用） |
+| 6 | 卸载 |
+| 0 | 退出 |
+
+## 文件位置
+
+| 路径 | 说明 |
+|---|---|
+| `/etc/argox/sing-box` | sing-box 二进制 |
+| `/etc/argox/config.json` | sing-box 配置 |
+| `/etc/argox/nginx.conf` | nginx 配置 |
+| `/etc/argox/cert.pem` / `key.pem` | TLS 证书 |
+| `/etc/argox/subscribe/base64` | SFA 订阅文件 |
+| `/etc/argox/subscribe/shadowrocket` | Shadowrocket 订阅文件 |
+| `/etc/argox/custom` | 用户参数（持久化） |
+| `/etc/argox/sing-box.log` | sing-box 日志 |
+| `/etc/argox/nginx-error.log` | nginx 错误日志 |
+| `/etc/systemd/system/sing-box.service` | sing-box 服务 |
+| `/etc/systemd/system/argox-nginx.service` | nginx 服务 |
+| `/etc/systemd/system/cloudflared.service` | cloudflared 服务（Argo 模式） |
 
 ## 主要变更（相对 v2.1.9）
 
