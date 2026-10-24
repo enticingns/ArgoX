@@ -81,6 +81,19 @@ NGINX_BIN=''
 # otherwise. Force with 'yes' (nginx does TLS) or 'no' (plain HTTP, edge does it).
 NGINX_TLS='auto'
 
+# Outbound egress facts, filled in by check_egress(). An IPv6-only box can run
+# the tunnel fine but can only reach IPv6 destinations.
+HAS_V4=''
+HAS_V6=''
+# auto = prefer IPv6 when the box has no IPv4 egress.
+DOMAIN_STRATEGY='auto'
+
+# VMess authenticates with a timestamp; the server and client clocks must agree
+# within roughly 90 seconds or every request is rejected even though TCP, TLS
+# and the WebSocket handshake all look perfectly healthy.
+TIME_TOLERANCE='30'
+TIME_OFFSET=''
+
 # Argo tunnel parameters — all optional, all overridable so you can drive your
 # own pre-created Cloudflare tunnel instead of the script's defaults.
 ARGO_DOMAIN=''            # hostname clients connect to (own domain)
@@ -216,6 +229,112 @@ nginx_bin() {
   for b in /usr/sbin/nginx /usr/bin/nginx /sbin/nginx /usr/local/nginx/sbin/nginx /usr/local/sbin/nginx; do
     [ -x "$b" ] && { echo "$b"; return 0; }
   done
+  return 1
+}
+
+# Probe outbound egress. Plenty of cheap VPS are IPv6-only: the tunnel and the
+# WebSocket handshake all look healthy, yet every proxied request dies because
+# the destination only has an A record and there is no IPv4 route. Detect that
+# up front instead of leaving the user with a node that "connects but is dead".
+check_egress() {
+  HAS_V4='no'; HAS_V6='no'
+  curl -4 -s -o /dev/null --max-time 6 http://1.1.1.1 2>/dev/null && HAS_V4='yes'
+  curl -6 -s -o /dev/null --max-time 6 https://[2606:4700:4700::1111] 2>/dev/null && HAS_V6='yes'
+
+  if [ "$HAS_V4" = 'yes' ]; then
+    info "$(t 'Egress: IPv4 OK, IPv6 ' "出网: IPv4 正常，IPv6 ")$([ "$HAS_V6" = 'yes' ] && t 'OK' '正常' || t 'unavailable' '不可用')"
+    return 0
+  fi
+
+  warning "$(t 'No IPv4 egress detected!' '检测不到 IPv4 出网！')"
+  if [ "$HAS_V6" = 'yes' ]; then
+    hint "$(t 'This box is IPv6-only. The tunnel will connect, but most sites (IPv4-only) will fail.' \
+              '本机是纯 IPv6。隧道能连上，但绝大多数网站只有 IPv4，会连接失败。')"
+    hint "$(t 'Domain resolution will be switched to prefer IPv6 so dual-stack sites still work.' \
+              '已自动切换为优先解析 IPv6，双栈站点仍可正常访问。')"
+    hint "$(t 'Real fix: ask your provider for an IPv4 address or IPv4 NAT.' \
+              '根本解法：向服务商申请 IPv4 地址或 IPv4 NAT 出口。')"
+  else
+    warning "$(t 'Neither IPv4 nor IPv6 egress works — this box cannot proxy anything.' \
+                 'IPv4 和 IPv6 出网都不通 —— 本机无法代理任何流量。')"
+  fi
+  return 1
+}
+
+# ============================================================
+# Clock: VMess is timestamp authenticated
+# ============================================================
+# Read the real time from an HTTPS Date header. Works over IPv6 and needs no
+# NTP port, which matters on boxes where outbound UDP/123 is filtered.
+remote_epoch() {
+  local u h
+  for u in https://www.cloudflare.com https://www.google.com https://api.github.com; do
+    h=$(curl -sI --max-time 8 "$u" 2>/dev/null \
+        | sed -n 's/^[Dd]ate: *//p' | tr -d '\r' | head -1)
+    [ -z "$h" ] && continue
+    LC_ALL=C date -u -d "$h" +%s 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# Echo (local - real) in seconds, or return 1 when no time source is reachable.
+time_offset() {
+  local re le
+  re=$(remote_epoch) || return 1
+  le=$(date -u +%s)
+  echo $((le - re))
+}
+
+# 0 = clock is within tolerance, 1 = drifted, 2 = could not measure
+check_time() {
+  local off abs
+  if ! off=$(time_offset); then
+    warning "$(t 'Could not read the real time (no HTTPS source reachable).' \
+                 '无法获取真实时间（HTTPS 时间源均不可达）。')"
+    TIME_OFFSET=''
+    return 2
+  fi
+  TIME_OFFSET="$off"
+  abs=${off#-}
+  if [ "$abs" -le "$TIME_TOLERANCE" ]; then
+    info "$(t "Clock OK (offset ${off}s)." "时间正常（偏差 ${off} 秒）。")"
+    return 0
+  fi
+  warning "$(t "Clock is off by ${off}s. VMess rejects requests beyond ~90s of skew." \
+               "本机时间偏差 ${off} 秒。VMess 超过约 90 秒就会认证失败。")"
+  return 1
+}
+
+# Bring the clock back in line. NTP first, then a direct set from HTTPS.
+fix_time() {
+  local off epoch
+  info "$(t 'Trying NTP first...' '先尝试 NTP 校时...')"
+  if command -v timedatectl >/dev/null 2>&1; then
+    systemctl enable --now systemd-timesyncd 2>/dev/null || true
+    timedatectl set-ntp true 2>/dev/null || true
+    sleep 4
+  fi
+  if off=$(time_offset) && [ "${off#-}" -le 5 ]; then
+    info "$(t "Clock corrected via NTP (offset ${off}s)." "NTP 校时成功（偏差 ${off} 秒）。")"
+    return 0
+  fi
+
+  info "$(t 'NTP did not converge; setting the clock from an HTTPS Date header.' \
+           'NTP 未能收敛；改用 HTTPS 响应头直接校时。')"
+  epoch=$(remote_epoch) || {
+    warning "$(t 'No time source reachable; cannot fix the clock.' \
+                 '没有可达的时间源，无法校时。')"
+    return 1
+  }
+  if date -u -s "@${epoch}" >/dev/null 2>&1; then
+    hwclock --systohc 2>/dev/null || true
+    off=$(time_offset) || off='?'
+    info "$(t "Clock set from HTTPS, new offset ${off}s." "已用 HTTPS 校时，新偏差 ${off} 秒。")"
+    TIME_OFFSET="$off"
+    return 0
+  fi
+  warning "$(t 'date -s failed (container without CAP_SYS_TIME?).' \
+               'date -s 失败（容器可能没有 CAP_SYS_TIME 权限）。')"
   return 1
 }
 
@@ -368,6 +487,25 @@ write_singbox_config() {
   #     through `direct`, which falls back to the system resolver. The legacy
   #     dns.servers[].address form was deprecated in 1.12 and removed in 1.14,
   #     so leaving DNS out keeps the config valid across versions.
+  #   * outbound.domain_strategy is gone in 1.14; the supported way to steer
+  #     address selection is a route rule with action=resolve + strategy.
+
+  local strategy="${DOMAIN_STRATEGY:-auto}"
+  if [ "$strategy" = 'auto' ]; then
+    if [ "${HAS_V4:-yes}" = 'no' ]; then strategy='prefer_ipv6'; else strategy=''; fi
+  fi
+  [ "$strategy" = 'none' ] && strategy=''
+
+  local route_block=''
+  if [ -n "$strategy" ]; then
+    route_block=",
+  \"route\": {
+    \"rules\": [
+      { \"action\": \"resolve\", \"strategy\": \"${strategy}\" }
+    ]
+  }"
+  fi
+
   cat > "$WORK_DIR/config.json" <<EOF
 {
   "log": {
@@ -393,7 +531,7 @@ write_singbox_config() {
   "outbounds": [
     { "type": "direct", "tag": "direct" },
     { "type": "block",  "tag": "block"  }
-  ]
+  ]${route_block}
 }
 EOF
 }
@@ -1156,6 +1294,7 @@ save_state() {
     printf 'ARGO_QUICK_HOST=%q\n'      "${ARGO_QUICK_HOST:-}"
     printf 'ARGO_METRICS_PORT=%q\n'    "${ARGO_METRICS_PORT:-20241}"
     printf 'NGINX_TLS=%q\n'            "${NGINX_TLS:-auto}"
+    printf 'DOMAIN_STRATEGY=%q\n'      "${DOMAIN_STRATEGY:-auto}"
   } > "$f"
 }
 
@@ -1384,6 +1523,15 @@ install_flow() {
   info "$(t "Installing dependencies..." "安装依赖...")"
   install_dependencies
 
+  info "$(t "Checking outbound connectivity..." "检测出网连通性...")"
+  check_egress || true
+
+  info "$(t "Checking system clock..." "检测系统时间...")"
+  if ! check_time; then
+    fix_time || warning "$(t 'Clock still off — VMess will fail until it is corrected.' \
+                               '时间仍未校准 —— 在校准前 VMess 无法工作。')"
+  fi
+
   info "$(t "Downloading sing-box..." "下载 sing-box...")"
   local latest
   latest=$(latest_singbox_version) && SINGBOX_VER="$latest" || SINGBOX_VER="$SINGBOX_DEFAULT_VERSION"
@@ -1540,6 +1688,144 @@ view_logs() {
   tail -n 100 "$WORK_DIR/sing-box.log"
 }
 
+# One-shot health check. Answers the question "it connects, but nothing works":
+# separates "the tunnel/nginx/sing-box chain is fine" from "this box cannot
+# reach the destination", which is the usual culprit on cheap VPS.
+doctor() {
+  load_state 2>/dev/null || true
+  local host ng sp problems=0
+  host=$(node_host); ng="${NGINX_PORT:-8080}"; sp="${SINGBOX_PORT:-30000}"
+
+  title "=============== $(t 'ArgoX-Lite doctor' 'ArgoX-Lite 自检') ==============="
+
+  # --- services
+  echo; cyan "$(t 'Services' '服务')"
+  local s st
+  for s in "$SERVICE_NAME" "$NGINX_SERVICE" "$ARGO_SERVICE"; do
+    [ "$s" = "$ARGO_SERVICE" ] && [ "$IS_ARGO" != 'yes' ] && continue
+    st=$(systemctl is-active "$s" 2>/dev/null || echo inactive)
+    if [ "$st" = 'active' ]; then info "  ${s}: ${st}"; else warning "  ${s}: ${st}"; problems=$((problems+1)); fi
+  done
+
+  # --- listeners
+  echo; cyan "$(t 'Listeners' '监听端口')"
+  for p in "$sp" "$ng"; do
+    if ss -lnt 2>/dev/null | grep -qE ":${p}([[:space:]]|$)"; then
+      info "  port ${p}: $(t 'listening' '已监听')"
+    else
+      warning "  port ${p}: $(t 'NOT listening' '未监听')"; problems=$((problems+1))
+    fi
+  done
+
+  # --- egress
+  echo; cyan "$(t 'Outbound egress' '出网连通性')"
+  local v4='no' v6='no'
+  curl -4 -s -o /dev/null --max-time 6 http://1.1.1.1 2>/dev/null && v4='yes'
+  curl -6 -s -o /dev/null --max-time 6 https://[2606:4700:4700::1111] 2>/dev/null && v6='yes'
+  [ "$v4" = 'yes' ] && info "  IPv4: OK" || warning "  IPv4: $(t 'DEAD' '不通')"
+  [ "$v6" = 'yes' ] && info "  IPv6: OK" || warning "  IPv6: $(t 'DEAD' '不通')"
+  if [ "$v4" = 'no' ]; then
+    problems=$((problems+1))
+    hint "$(t '  -> IPv6-only box: the tunnel will connect but most sites are IPv4-only.' \
+              '  -> 纯 IPv6 机器：隧道能连上，但绝大多数网站只有 IPv4，会连不上。')"
+    hint "$(t '  -> Ask your provider for IPv4, or set DOMAIN_STRATEGY=prefer_ipv6 for dual-stack only.' \
+              '  -> 向服务商申请 IPv4；或设 DOMAIN_STRATEGY=prefer_ipv6 只保证双栈站点可用。')"
+  fi
+  [ "$v4" = 'no' ] && [ "$v6" = 'no' ] && { warning "$(t '  -> no egress at all, nothing can be proxied' '  -> 完全无出网，无法代理任何流量')"; }
+
+  # --- clock (VMess is timestamp authenticated)
+  echo; cyan "$(t 'System clock' '系统时间')"
+  local off
+  if off=$(time_offset); then
+    info "  $(t 'local UTC' '本机 UTC'): $(date -u '+%Y-%m-%d %H:%M:%S')"
+    if [ "${off#-}" -le "$TIME_TOLERANCE" ]; then
+      info "  $(t "offset ${off}s — within tolerance" "偏差 ${off} 秒 —— 在容差内")"
+    else
+      warning "  $(t "offset ${off}s — TOO FAR, VMess auth will fail" "偏差 ${off} 秒 —— 超差，VMess 认证会失败")"
+      hint "$(t '  -> run: bash argox.sh -t   (or menu [8] shows it, -t fixes it)' \
+                '  -> 执行: bash argox.sh -t   （菜单 [8] 可查看，-t 修复）')"
+      problems=$((problems+1))
+    fi
+  else
+    warning "  $(t 'cannot read real time (no HTTPS source)' '无法获取真实时间（无 HTTPS 时间源）')"
+  fi
+  local ts
+  ts=$(systemctl is-active systemd-timesyncd 2>/dev/null || echo inactive)
+  [ "$ts" = 'active' ] && info "  NTP: systemd-timesyncd active" \
+                       || hint "  $(t 'NTP: not running (clock will drift)' 'NTP: 未运行（时间会漂移）')"
+
+  # --- configs
+  echo; cyan "$(t 'Config validity' '配置有效性')"
+  if [ -x "$WORK_DIR/sing-box" ] && [ -s "$WORK_DIR/config.json" ]; then
+    if "$WORK_DIR/sing-box" check -c "$WORK_DIR/config.json" >/dev/null 2>&1; then
+      info "  sing-box config: OK"
+    else
+      warning "  sing-box config: $(t 'INVALID' '无效')"; problems=$((problems+1))
+    fi
+  fi
+  local nb
+  if nb=$(nginx_bin) && [ -s "$WORK_DIR/nginx.conf" ]; then
+    if "$nb" -c "$WORK_DIR/nginx.conf" -t >/dev/null 2>&1; then
+      info "  nginx config: OK"
+    else
+      warning "  nginx config: $(t 'INVALID' '无效')"; problems=$((problems+1))
+    fi
+  fi
+
+  # --- end-to-end probes
+  echo; cyan "$(t 'End-to-end probes' '端到端探测')"
+  local ws="/${WS_PATH:-argox-ws-vm}" code
+  code=$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 8 \
+    -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+    "http://127.0.0.1:${sp}${ws}" 2>/dev/null)
+  [ "$code" = '101' ] && info "  sing-box WS: 101" || { warning "  sing-box WS: ${code}"; problems=$((problems+1)); }
+
+  code=$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 8 \
+    -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+    -H "Host: ${host}" "http://127.0.0.1:${ng}${ws}" 2>/dev/null)
+  [ "$code" = '101' ] && info "  nginx WS: 101" || { warning "  nginx WS: ${code}"; problems=$((problems+1)); }
+
+  if [ "$IS_ARGO" = 'yes' ] && [ -n "$ARGO_DOMAIN" ]; then
+    code=$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 25 \
+      -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+      -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+      "https://${ARGO_DOMAIN}${ws}" 2>/dev/null)
+    [ "$code" = '101' ] && info "  tunnel WS: 101" || { warning "  tunnel WS: ${code}"; problems=$((problems+1)); }
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 \
+      "https://${ARGO_DOMAIN}/${UUID}/subscribe/base64" 2>/dev/null)
+    [ "$code" = '200' ] && info "  subscription via tunnel: 200" || { warning "  subscription via tunnel: ${code}"; problems=$((problems+1)); }
+  fi
+
+  # --- recent proxy errors
+  echo; cyan "$(t 'Recent proxy errors (last 5)' '最近代理错误（最后 5 条）')"
+  if [ -f "$WORK_DIR/sing-box.log" ]; then
+    # OpenVZ containers make sing-box's interface monitor log this every second;
+    # it is harmless noise that would otherwise bury the real failures.
+    local real
+    real=$(grep 'ERROR' "$WORK_DIR/sing-box.log" 2>/dev/null | grep -v 'check interface' | tail -5)
+    if [ -n "$real" ]; then printf '%s\n' "$real" | sed 's/^/  /'; else info "  $(t 'none' '无')"; fi
+    local to
+    to=$(grep 'ERROR' "$WORK_DIR/sing-box.log" 2>/dev/null | grep -c 'i/o timeout' || echo 0)
+    [ "$to" -gt 0 ] && hint "$(t "  -> ${to} dial timeouts: destinations unreachable from this box" \
+                               "  -> ${to} 条拨号超时：本机到目标不可达")"
+    local noise
+    noise=$(grep -c 'check interface' "$WORK_DIR/sing-box.log" 2>/dev/null || echo 0)
+    [ "$noise" -gt 0 ] && hint "$(t "  (${noise} 'check interface' lines ignored — OpenVZ netlink noise)" \
+                                   "  （已忽略 ${noise} 条 'check interface' —— OpenVZ netlink 噪声）")"
+  fi
+
+  # --- verdict
+  echo
+  if [ "$problems" -eq 0 ]; then
+    info "$(t 'VERDICT: all checks passed.' '结论：全部检查通过。')"
+  else
+    warning "$(t "VERDICT: ${problems} problem(s) found, see above." "结论：发现 ${problems} 个问题，见上。")"
+  fi
+  echo
+}
+
 reconfigure() {
   local _u _p _d _t _sp _np _n
   [ "$IS_INSTALLED" = 'yes' ] || die "$(t 'Not installed.' '尚未安装。')"
@@ -1636,6 +1922,7 @@ menu() {
    [3] 更新 sing-box (Update)
    [4] 重新配置    (Reconfigure parameters)
    [5] 查看日志    (Tail logs)
+   [8] 自检诊断    (Doctor / health check)
    [6] 卸载        (Uninstall)
    [7] Argo 隧道  (Cloudflare Argo Tunnel)
    [0] 退出        (Exit)
@@ -1656,6 +1943,7 @@ MENU
     4) reconfigure; pause ;;
     5) view_logs; pause ;;
     7) argo_menu ;;
+    8) doctor; pause ;;
     6) uninstall; pause ;;
     0) exit 0 ;;
     *) warning "$(t 'Invalid choice.' '非法输入。')"; pause; menu ;;
@@ -1680,6 +1968,8 @@ Options:
   -u, --uninstall     Uninstall ArgoX-Lite
   -v, --update        Update sing-box to the latest release
   -n, --node          Show node info and subscription URLs
+  -d, --doctor        Run a health check (services, egress, clock, probes)
+  -t, --time          Check the system clock and correct it if it has drifted
   -a, --argo          Enable Cloudflare Argo Tunnel mode (requires config)
   -f, --file FILE     Non-interactive install using a config file (see config.conf)
   -l, --lang [C|E]    Language: C (Chinese, default) or E (English)
@@ -1699,6 +1989,8 @@ parse_args() {
       -u|--uninstall) uninstall; exit 0 ;;
       -v|--update)    update_singbox; exit 0 ;;
       -n|--node)      display_node_info; exit 0 ;;
+      -d|--doctor)    doctor; exit 0 ;;
+      -t|--time)      check_time || fix_time; exit $? ;;
       -a|--argo)      IS_ARGO='yes' ;;
       -f|--file)      apply_config_file "${1:-}"; shift 2>/dev/null || true; install_flow; exit 0 ;;
       -l|--lang)      case "${1:-}" in C|c) LANG_TAG='C' ;; E|e) LANG_TAG='E' ;; esac; shift 2>/dev/null || true ;;
