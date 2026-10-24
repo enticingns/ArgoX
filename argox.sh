@@ -40,8 +40,16 @@ CDN_DOMAIN_HINT=('skk.moe' 'ip.sb' 'time.is' 'cfip.xxxxxxxx.tk' 'bestcf.top' 'cd
 MIN_PORT=100
 MAX_PORT=65520
 
-# GitHub acceleration proxies (used to bypass GFW on server-side downloads)
-GH_PROXIES=('https://ghproxy.lvedong.eu.org/' 'https://accel.cloudflare.nyc.mn/')
+# GitHub acceleration mirrors, tried in order (plain path prefixes).
+# Override with:  SINGBOX_MIRRORS='https://my.mirror/'  before running.
+# Verified reachable from CN: ghfast.top, gh-proxy.com, ghproxy.lvedong, accel.cloudflare
+GH_PROXIES=(
+  'https://ghfast.top/'
+  'https://gh-proxy.com/'
+  'https://ghproxy.lvedong.eu.org/'
+  'https://accel.cloudflare.nyc.mn/'
+)
+[ -n "${SINGBOX_MIRRORS:-}" ] && read -r -a GH_PROXIES <<< "$SINGBOX_MIRRORS"
 
 # Language (C=Chinese, E=English). Defaults to Chinese for the primary audience.
 LANG_TAG='C'
@@ -196,11 +204,18 @@ is_domain() {
 }
 
 find_free_port() {
-  local start=$1 port=$start
+  # NOTE: `local a=$1 b=$a` does NOT work — bash expands every word before the
+  # assignment runs, so $a is still empty there. Assign on separate lines.
+  local start="${1:-$START_PORT_DEFAULT}" port i
+  start="${start:-30000}"
+  port="$start"
   for i in $(seq 0 500); do
-    if ! ss -lntup 2>/dev/null | grep -qE ":[${port}] "; then echo $port; return 0; fi
+    # Match the numeric port exactly: ":30000" must not be read as "[30000]".
+    if ! ss -lntu 2>/dev/null | grep -qE ":${port}([[:space:]]|$)"; then
+      echo "$port"; return 0
+    fi
     port=$((port+1))
-    [ $port -gt $MAX_PORT ] && return 1
+    [ "$port" -gt "$MAX_PORT" ] && return 1
   done
   return 1
 }
@@ -224,7 +239,7 @@ latest_singbox_version() {
 }
 
 download_singbox() {
-  local ver="$1" pkg url proxy path
+  local ver="$1" pkg url proxy found
   pkg="sing-box-${ver}-linux-${ARCH}"
   mkdir -p "$WORK_DIR"
   cd "$WORK_DIR" || die "cannot cd $WORK_DIR"
@@ -232,22 +247,59 @@ download_singbox() {
   # Backup previous binary before swap (allows rollback on start failure)
   [ -x sing-box ] && mv sing-box "sing-box.$(date +%s).bak" 2>/dev/null
 
-  for proxy in "${GH_PROXIES[@]}"; do
-    url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/${pkg}.tar.gz"
-    info "Downloading sing-box v${ver} (${ARCH}) ... ${proxy}"
-    if curl -sL --max-time 60 --retry 2 --retry-delay 2 "${proxy}${url}" -o "${pkg}.tar.gz" 2>/dev/null || \
-       curl -sL --max-time 60 --retry 2 --retry-delay 2 "${url}" -o "${pkg}.tar.gz" 2>/dev/null; then
-      tar -xzf "${pkg}.tar.gz"
-      rm -f "${pkg}.tar.gz"
-      # Alpine/musl build: prefer -musl variant if present
-      if [ -f "${pkg}-musl.tar.gz" ]; then
-        tar -xzf "${pkg}-musl.tar.gz" 2>/dev/null || true
-        rm -f "${pkg}-musl.tar.gz"
-      fi
-      chmod +x sing-box 2>/dev/null
-      [ -x sing-box ] && { info "sing-box v${ver} installed"; return 0; }
+  url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/${pkg}.tar.gz"
+
+  # Try each GitHub mirror, then direct. Mirrors are plain path prefixes.
+  for proxy in "${GH_PROXIES[@]}" ''; do
+    [ -z "$proxy" ] && info "Downloading sing-box v${ver} (${ARCH}) ... direct" \
+                    || info "Downloading sing-box v${ver} (${ARCH}) ... ${proxy}"
+    rm -f "${pkg}.tar.gz"
+    # 31 MB payload: generous timeout, retries, and a resume-friendly range request
+    if ! curl -fL --max-time 300 --retry 3 --retry-delay 2 --connect-timeout 15 \
+         "${proxy}${url}" -o "${pkg}.tar.gz" 2>/dev/null; then
+      continue
     fi
+    [ -s "${pkg}.tar.gz" ] || continue
+    # Reject HTML error pages saved by a mirror
+    if ! gzip -t "${pkg}.tar.gz" 2>/dev/null; then
+      warning "  mirror returned a non-gzip payload; trying next"
+      rm -f "${pkg}.tar.gz"
+      continue
+    fi
+
+    # The release tarball unpacks into <pkg>/ — pull the binary out of it.
+    rm -rf "${pkg}"
+    if ! tar -xzf "${pkg}.tar.gz" 2>/dev/null; then
+      rm -f "${pkg}.tar.gz"
+      continue
+    fi
+    rm -f "${pkg}.tar.gz"
+
+    found=''
+    if   [ -f "${pkg}/sing-box" ];  then found="${pkg}/sing-box"
+    elif [ -f "./sing-box" ];       then found='./sing-box'
+    else found=$(find . -maxdepth 3 -type f -name sing-box 2>/dev/null | head -1)
+    fi
+
+    if [ -n "$found" ] && [ -s "$found" ]; then
+      [ "$found" = './sing-box' ] || mv -f "$found" ./sing-box
+      chmod +x sing-box 2>/dev/null
+      rm -rf "${pkg}"
+      if singbox_version_of ./sing-box >/dev/null 2>&1 && [ -x sing-box ]; then
+        info "sing-box v${ver} installed"
+        return 0
+      fi
+    fi
+    rm -rf "${pkg}"
   done
+
+  # All sources failed — restore the newest backup so the box keeps working.
+  local bak
+  bak=$(ls -1t sing-box.*.bak 2>/dev/null | head -1)
+  if [ -n "$bak" ]; then
+    mv -f "$bak" sing-box
+    warning "$(t "Download failed; restored previous sing-box from ${bak}." "下载失败，已回滚到旧的 sing-box（${bak}）。")"
+  fi
   die "Failed to download sing-box v${ver}"
 }
 
